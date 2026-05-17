@@ -30,6 +30,7 @@ from telegram.ext import (
 import db
 import personas
 import quick_prompts
+import rate_limiter
 import streaming
 import ui
 from markdown_utils import chunk_for_telegram, to_telegram_html
@@ -80,14 +81,31 @@ def _config() -> dict[str, str | int | float]:
         "db_path": os.getenv("CHAT_DB_PATH", default_db_path),
         "admin_ids": admin_ids,
         "auto_title": os.getenv("AUTO_TITLE", "1") not in ("0", "false", "False"),
+        "rate_limit_per_minute": int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
+        "rate_limit_per_day": int(os.getenv("RATE_LIMIT_PER_DAY", "500")),
+        "waitlist_mode": os.getenv("WAITLIST_MODE", "0") in ("1", "true", "True"),
     }
 
 
 # --- Pref helpers -----------------------------------------------------------
 
-async def _ensure_prefs(db_path: str, user_id: int, default_model: str) -> db.UserPrefs:
+async def _ensure_prefs(
+    db_path: str,
+    user_id: int,
+    default_model: str,
+    *,
+    waitlist_mode: bool = False,
+    admin_ids: tuple[int, ...] = (),
+    display_name: str = "",
+) -> db.UserPrefs:
     prefs = await db.get_user_prefs(db_path, user_id)
     if prefs is None:
+        is_admin = user_id in admin_ids
+        initial_status = (
+            db.STATUS_ACTIVE
+            if (is_admin or not waitlist_mode)
+            else db.STATUS_WAITLIST
+        )
         await db.upsert_user_prefs(
             db_path,
             user_id,
@@ -95,9 +113,15 @@ async def _ensure_prefs(db_path: str, user_id: int, default_model: str) -> db.Us
             persona="default",
             ui_language="id",
             onboarded=False,
+            status=initial_status,
+            display_name=display_name,
         )
         prefs = await db.get_user_prefs(db_path, user_id)
         assert prefs is not None
+    elif display_name and prefs.display_name != display_name:
+        # Keep the latest display name fresh so admin lists are useful.
+        await db.upsert_user_prefs(db_path, user_id, display_name=display_name)
+        prefs = await db.get_user_prefs(db_path, user_id) or prefs
     return prefs
 
 
@@ -108,6 +132,94 @@ def _active_model(prefs: db.UserPrefs, default: str) -> str:
 def _t(prefs: db.UserPrefs, id_text: str, en_text: str) -> str:
     """Tiny translation helper: pick text based on user's UI language."""
     return en_text if prefs.ui_language == "en" else id_text
+
+
+def _admin_ids(context: ContextTypes.DEFAULT_TYPE) -> tuple[int, ...]:
+    return tuple(context.application.bot_data.get("admin_ids") or ())
+
+
+def _is_admin(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    return user_id in _admin_ids(context)
+
+
+def _waitlist_mode(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.application.bot_data.get("waitlist_mode"))
+
+
+def _display_name_from_update(update: Update) -> str:
+    user = update.effective_user
+    if user is None:
+        return ""
+    parts: list[str] = []
+    if user.username:
+        parts.append("@" + user.username)
+    full = " ".join(p for p in (user.first_name, user.last_name) if p)
+    if full and full not in parts:
+        parts.append(full)
+    return " — ".join(parts)[:80]
+
+
+async def _admit(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[db.UserPrefs | None, str | None]:
+    """Ensure prefs + enforce waitlist & rate limit for chat actions.
+
+    Returns ``(prefs, deny_text)``. When ``deny_text`` is non-empty the caller
+    must show it to the user and bail (the user is either banned, on the
+    waitlist, or being rate-limited).  When ``prefs`` is ``None`` we could not
+    determine the user (caller should also bail).
+    """
+    if update.effective_user is None:
+        return None, None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    admin_ids = _admin_ids(context)
+    waitlist_mode = _waitlist_mode(context)
+    prefs = await _ensure_prefs(
+        db_path,
+        user_id,
+        default_model,
+        waitlist_mode=waitlist_mode,
+        admin_ids=admin_ids,
+        display_name=_display_name_from_update(update),
+    )
+    # Admins always pass.
+    if user_id in admin_ids:
+        return prefs, None
+    if prefs.status == db.STATUS_BANNED:
+        return prefs, _t(
+            prefs,
+            "🚫 Akses kamu diblokir admin bot ini.",
+            "🚫 Your access has been blocked by an admin.",
+        )
+    if prefs.status == db.STATUS_WAITLIST:
+        return prefs, _t(
+            prefs,
+            "⏳ Kamu sedang di waitlist. Admin akan meninjau akses kamu.\n"
+            f"Kalau perlu, kirim user ID ini ke admin: <code>{user_id}</code>",
+            "⏳ You're on the waitlist. An admin must approve your access.\n"
+            f"Send this user ID to the admin if asked: <code>{user_id}</code>",
+        )
+    rl: rate_limiter.RateLimiter | None = context.application.bot_data.get(
+        "rate_limiter"
+    )
+    if rl is not None and not rl.is_disabled():
+        result = await rl.check_and_consume(user_id)
+        if not result.allowed:
+            human = rate_limiter.format_retry(result.retry_after, prefs.ui_language)
+            if result.reason == "day":
+                return prefs, _t(
+                    prefs,
+                    f"⏱ Limit harian tercapai. Coba lagi nanti (sekitar {human}).",
+                    f"⏱ Daily limit reached. Try again later (~{human}).",
+                )
+            return prefs, _t(
+                prefs,
+                f"⏱ Pelan-pelan, ya. Tunggu {human} lagi sebelum kirim lagi.",
+                f"⏱ Slow down. Wait {human} before sending again.",
+            )
+    return prefs, None
 
 
 # --- Session helpers --------------------------------------------------------
@@ -1202,6 +1314,157 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(f"Broadcast terkirim ke {sent}/{len(targets)} user.")
 
 
+# --- Admin: access management ----------------------------------------------
+
+def _parse_user_id_arg(args: list[str] | None) -> int | None:
+    if not args:
+        return None
+    raw = args[0].strip().lstrip("@")
+    if not raw.lstrip("-").isdigit():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+async def _notify_user_status_change(
+    context: ContextTypes.DEFAULT_TYPE, target_user_id: int, new_status: str
+) -> None:
+    """Best-effort DM to inform a user that their access status changed."""
+    messages = {
+        db.STATUS_ACTIVE: "\u2705 Akses kamu sudah disetujui. Selamat datang!",
+        db.STATUS_WAITLIST: "\u23f3 Akses kamu dipindahkan ke waitlist oleh admin.",
+        db.STATUS_BANNED: "\U0001f6ab Akses kamu diblokir oleh admin.",
+    }
+    msg = messages.get(new_status)
+    if not msg:
+        return
+    try:
+        await context.bot.send_message(target_user_id, msg)
+    except Exception:  # noqa: BLE001
+        logger.debug("status notification to %s failed", target_user_id, exc_info=True)
+
+
+async def _set_user_status_admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    new_status: str,
+    *,
+    success_text: str,
+) -> None:
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("\u274c Command admin only.")
+        return
+    target_id = _parse_user_id_arg(list(context.args or []))
+    if target_id is None:
+        await update.message.reply_text(
+            "Pakai: /approve|/deny|/ban|/unban <telegram_user_id>"
+        )
+        return
+    db_path: str = context.application.bot_data["db_path"]
+    prefs = await db.get_user_prefs(db_path, target_id)
+    if prefs is None:
+        # Pre-create record so admin can pre-approve before user joins.
+        await db.upsert_user_prefs(
+            db_path,
+            target_id,
+            default_model=context.application.bot_data["default_model"],
+            persona="default",
+            ui_language="id",
+            onboarded=False,
+            status=new_status,
+        )
+    else:
+        await db.upsert_user_prefs(db_path, target_id, status=new_status)
+    await update.message.reply_text(
+        f"{success_text} (user {target_id}, status={new_status})."
+    )
+    await _notify_user_status_change(context, target_id, new_status)
+
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_user_status_admin(
+        update, context, db.STATUS_ACTIVE, success_text="\u2705 User diizinkan"
+    )
+
+
+async def deny_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_user_status_admin(
+        update,
+        context,
+        db.STATUS_WAITLIST,
+        success_text="\u23f3 User dikembalikan ke waitlist",
+    )
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_user_status_admin(
+        update, context, db.STATUS_BANNED, success_text="\U0001f6ab User diblokir"
+    )
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_user_status_admin(
+        update, context, db.STATUS_ACTIVE, success_text="\u2705 User di-unban"
+    )
+
+
+def _fmt_user_row(user_id: int, name: str, ts: str) -> str:
+    safe_name = html.escape(name) if name else "(tanpa nama)"
+    return f"\u2022 <code>{user_id}</code> \u2014 {safe_name} <i>(sejak {ts})</i>"
+
+
+async def waitlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("\u274c Command admin only.")
+        return
+    db_path: str = context.application.bot_data["db_path"]
+    rows = await db.list_users_by_status(db_path, db.STATUS_WAITLIST, limit=50)
+    if not rows:
+        await update.message.reply_text(
+            "\U0001f389 Tidak ada user di waitlist.\n\n"
+            "<i>Tip: /approve &lt;user_id&gt; untuk izinkan, /ban &lt;user_id&gt; untuk blokir.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["<b>\u23f3 Waitlist</b>"]
+    for uid, name, ts in rows:
+        lines.append(_fmt_user_row(uid, name, ts))
+    lines.append(
+        "\n<i>/approve &lt;user_id&gt; \u2014 izinkan. /ban &lt;user_id&gt; \u2014 blokir.</i>"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("\u274c Command admin only.")
+        return
+    db_path: str = context.application.bot_data["db_path"]
+    counts = await db.count_users_by_status(db_path)
+    total = sum(counts.values()) or 0
+    lines = [
+        "<b>\U0001f465 Users</b>",
+        f"\u2022 Active: <b>{counts.get(db.STATUS_ACTIVE, 0)}</b>",
+        f"\u2022 Waitlist: <b>{counts.get(db.STATUS_WAITLIST, 0)}</b>",
+        f"\u2022 Banned: <b>{counts.get(db.STATUS_BANNED, 0)}</b>",
+        f"\u2022 Total: <b>{total}</b>",
+    ]
+    waitlist_mode = _waitlist_mode(context)
+    lines.append(
+        f"\n<i>WAITLIST_MODE: <b>{'on' if waitlist_mode else 'off'}</b>. "
+        f"User baru otomatis masuk waitlist kalau on.</i>"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # --- /cancel ----------------------------------------------------------------
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1261,6 +1524,22 @@ async def _send_ai_reply(
         streaming.animate(placeholder, stop_event, prefs.ui_language)
     )
 
+    async def _keep_typing() -> None:
+        # Telegram's typing indicator expires after ~5s; refresh every 4s.
+        while not stop_event.is_set():
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.TYPING
+                )
+            except Exception:  # noqa: BLE001 - best effort
+                logger.debug("send_chat_action failed", exc_info=True)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                continue
+
+    typing_task = asyncio.create_task(_keep_typing())
+
     try:
         history = await db.get_messages(db_path, sid, limit=history_max)
         # If we're regenerating, the popped user message is `user_message`
@@ -1284,10 +1563,11 @@ async def _send_ai_reply(
             return
     finally:
         stop_event.set()
-        try:
-            await anim_task
-        except Exception:  # noqa: BLE001
-            pass
+        for task in (anim_task, typing_task):
+            try:
+                await task
+            except Exception:  # noqa: BLE001
+                pass
 
     reply = (reply or "").strip() or "(AI mengembalikan response kosong.)"
     if persist_user:
@@ -1355,7 +1635,12 @@ async def chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     db_path: str = context.application.bot_data["db_path"]
     default_model: str = context.application.bot_data["default_model"]
-    prefs = await _ensure_prefs(db_path, user_id, default_model)
+    prefs, deny = await _admit(update, context)
+    if prefs is None:
+        return
+    if deny:
+        await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
 
     if not prefs.onboarded:
         await _start_onboarding(update, context, prefs)
@@ -1414,6 +1699,13 @@ async def regenerate_callback(
         sid = int(query.data[len(ui.REGEN_PREFIX):])
     except ValueError:
         await query.answer()
+        return
+    prefs, deny = await _admit(update, context)
+    if prefs is None:
+        await query.answer()
+        return
+    if deny:
+        await query.answer(re.sub(r"<[^>]+>", "", deny), show_alert=True)
         return
     db_path: str = context.application.bot_data["db_path"]
     session = await db.get_session(db_path, sid)
@@ -1477,6 +1769,20 @@ async def _post_init(application: Application) -> None:
         timeout=float(cfg["timeout"]),
     )
     application.bot_data["tans_client"] = client
+    rl = rate_limiter.RateLimiter(
+        per_minute=int(cfg.get("rate_limit_per_minute", 0)),
+        per_day=int(cfg.get("rate_limit_per_day", 0)),
+        admin_ids=tuple(cfg.get("admin_ids") or ()),
+    )
+    application.bot_data["rate_limiter"] = rl
+    if rl.is_disabled():
+        logger.info("Rate limiter disabled (per_minute=0, per_day=0)")
+    else:
+        logger.info(
+            "Rate limiter: %s/min, %s/day", rl.per_minute, rl.per_day
+        )
+    if cfg.get("waitlist_mode"):
+        logger.info("WAITLIST_MODE on — new users default to 'waitlist' status.")
 
 
 async def _post_shutdown(application: Application) -> None:
@@ -1504,6 +1810,9 @@ def build_application() -> Application:
             "db_path": cfg["db_path"],
             "admin_ids": cfg["admin_ids"],
             "auto_title": cfg["auto_title"],
+            "rate_limit_per_minute": cfg["rate_limit_per_minute"],
+            "rate_limit_per_day": cfg["rate_limit_per_day"],
+            "waitlist_mode": cfg["waitlist_mode"],
         }
     )
 
@@ -1524,6 +1833,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("approve", approve_command))
+    application.add_handler(CommandHandler("deny", deny_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(CommandHandler("waitlist", waitlist_command))
+    application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
 
     application.add_handler(

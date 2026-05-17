@@ -51,10 +51,26 @@ quality-of-life lain — semuanya bisa diakses lewat tombol di area ketik.
 - **Multi-bahasa UI** (Indonesia / English) — beberapa label menyesuaikan
   bahasa user.
 
+### Akses & Rate Limit
+- **Rate limit per user** — atur `RATE_LIMIT_PER_MINUTE` dan `RATE_LIMIT_PER_DAY` di
+  `.env`. Bot bakal otomatis balas pesan throttle yang ramah (bukan crash) kalau
+  user lewati limit. Set ke `0` untuk nonaktifkan. Admin lolos otomatis.
+- **Waitlist mode** — set `WAITLIST_MODE=1`, user baru otomatis masuk status
+  `waitlist` dan harus disetujui admin pakai `/approve <user_id>` sebelum bisa
+  chat. Cocok untuk bot publik beta supaya tidak kebanjiran.
+- **Typing indicator** terus dirender (refresh tiap 4 detik) selama bot
+  nunggu jawaban AI, jadi Telegram benar-benar nunjukin "is typing..." di
+  header chat.
+
 ### Stats & Admin
 - **`/stats`** — sesi, jumlah pesan diproses, estimasi token in/out per user.
 - **Admin commands** (set `ADMIN_TELEGRAM_IDS` di `.env`):
   - `/admin` — stats global (users, sessions, messages).
+  - `/users` — hitungan user per status (active / waitlist / banned).
+  - `/waitlist` — daftar user yang menunggu persetujuan.
+  - `/approve <user_id>` — izinkan user untuk chat.
+  - `/deny <user_id>` — kembalikan user ke waitlist.
+  - `/ban <user_id>` / `/unban <user_id>` — blokir / buka blokir user.
   - `/broadcast <pesan>` — kirim pengumuman ke semua user yang pernah pakai bot.
 
 ## Prasyarat
@@ -125,6 +141,11 @@ onboarding wizard (3 langkah).
 | `/reset` | Hapus sesi aktif |
 | `/cancel` | Batalkan aksi pending (rename, quick prompt input, dll) |
 | `/admin` | (admin) Stats global |
+| `/users` | (admin) Hitungan user per status |
+| `/waitlist` | (admin) Daftar user menunggu persetujuan |
+| `/approve <user_id>` | (admin) Izinkan user |
+| `/deny <user_id>` | (admin) Kembalikan user ke waitlist |
+| `/ban <user_id>` / `/unban <user_id>` | (admin) Blokir / buka blokir |
 | `/broadcast <msg>` | (admin) Kirim pengumuman ke semua user |
 
 ## Cara kerja history & persona
@@ -175,6 +196,7 @@ telegram-tans-ai-bot/
 ├── personas.py         # System prompt presets
 ├── quick_prompts.py    # Quick-prompt templates
 ├── streaming.py        # "Typing animation" placeholder helper
+├── rate_limiter.py     # Per-user async token bucket (per-minute + per-day)
 ├── markdown_utils.py   # Markdown → Telegram HTML converter
 ├── chat_history.db     # SQLite DB (auto-dibuat saat run pertama; di-gitignore)
 ├── requirements.txt
