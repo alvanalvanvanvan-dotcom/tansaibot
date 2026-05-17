@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+*.log
+# SQLite chat history database (per-user data — never commit)
+chat_history.db
+chat_history.db-journal
+chat_history.db-wal
+chat_history.db-shm
+.ruff_cache/
