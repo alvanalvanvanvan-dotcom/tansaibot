@@ -2,24 +2,60 @@
 
 Bot Telegram yang meneruskan pesan pengguna ke **Tans AI API Gateway**
 (`http://localhost:20130/api/v1`) dan membalas dengan respons AI. Mendukung
-ganti model, daftar model, dan riwayat percakapan per pengguna.
+ganti model, persona, riwayat percakapan, quick prompt, dan banyak fitur
+quality-of-life lain — semuanya bisa diakses lewat tombol di area ketik.
 
 ## Fitur
 
-- **Tombol persistent** di bawah area ketik — `New Chat`, `History`, `Pilih Model`, `Status`, `Bantuan`, `Reset Chat`. Tap langsung, tidak perlu ngetik command.
-- **New Chat (📝)** — mulai sesi percakapan baru kosong. Sesi sebelumnya tetap tersimpan di History.
-- **History (📚)** — daftar riwayat percakapan kamu sebagai tombol inline (judul = pesan pertama kamu, plus tanggal). Tap untuk melanjutkan sesi lama — AI akan tetap dapat konteks dari pesan-pesan sebelumnya.
-- **Persisten ke SQLite** — semua sesi dan pesan disimpan di `chat_history.db`. Riwayat tidak hilang walau bot di-restart.
-- **Inline keyboard** saat pilih model: tap nama model untuk langsung ganti (ada centang ✅ di model aktif).
-- Chat dasar: kirim pesan biasa → AI balas dengan konteks sesi aktif.
-- `/start`, `/help` — sapaan dan bantuan (juga tampilkan ulang tombol).
-- `/status` — cek koneksi & validitas API key (via `GET /api/v1/status`).
-- `/models` — daftar model AI yang tersedia (via `GET /api/v1/models`).
-- `/model <nama>` — ganti model aktif via teks (alternatif tombol).
-- `/new` — alias `New Chat`.
-- `/history` — alias `History`.
-- `/reset` — hapus sesi aktif sekarang (juga hilang dari History).
-- **Context memory per sesi**: 20 pesan terakhir dikirim ke AI sebagai konteks (bisa diubah lewat `HISTORY_MAX_MESSAGES`).
+### Inti
+- **Tombol persistent** di bawah area ketik: `New Chat`, `History`, `Quick Prompt`,
+  `Persona`, `Model`, `Status`, `Settings`, `Bantuan`, `Reset Chat`.
+- **Chat dasar**: kirim pesan biasa → AI balas dengan konteks sesi aktif.
+- **Persisten ke SQLite**: semua sesi, pesan, dan preferensi user disimpan di
+  `chat_history.db`. Tidak hilang saat bot di-restart.
+- **Context memory per sesi**: 20 pesan terakhir dikirim ke AI sebagai konteks
+  (atur lewat `HISTORY_MAX_MESSAGES`).
+
+### Refresh UX
+- **Streaming feel** — placeholder dengan animasi titik berjalan saat menunggu
+  jawaban AI, lalu di-edit ke jawaban final. Tidak butuh perubahan API.
+- **Markdown rendering** — `**bold**`, `*italic*`, `code`, code blocks, link,
+  bullet list, dan heading dirender rapi di Telegram (HTML mode).
+- **Tombol Regenerate** muncul di bawah tiap jawaban AI — sekali tap, jawaban
+  digenerate ulang dari pertanyaan yang sama.
+- **Auto-title cerdas** — setelah pertukaran pertama selesai, judul sesi di-set
+  otomatis dengan minta AI buatkan ringkasan 3–6 kata (bisa dimatikan via
+  `AUTO_TITLE=0`).
+
+### Persona & Quick Prompt
+- **Persona / Mode AI** — pilih gaya jawaban: Default, Coder, Writer, Translator,
+  Tutor, Analyst, atau Custom (tulis system prompt sendiri). System prompt
+  preset di-prepend otomatis ke tiap pesan.
+- **Quick Prompt templates** — tap `⚡ Quick Prompt` lalu pilih template
+  (Translate, Summarize, Explain Code, Brainstorm, Bantu Balas, Perbaiki Tulisan).
+  Bot tanya isi → langsung jalankan prompt yang sudah dioptimasi.
+
+### Manajemen Sesi & History
+- **History dengan pagination** — 8 sesi per halaman, navigasi `⬅️ Prev / Next ➡️`.
+- **Menu per sesi (⋯)** — Rename, Pin, Archive, Export, Delete. Sesi yang di-pin
+  selalu nongol di atas.
+- **Pencarian** — `/find <kata>` atau tombol `🔍 Cari` cari berdasarkan judul
+  atau isi pesan.
+- **Export sesi** ke file Markdown (`.md`) lewat tombol Export.
+
+### Preferences & Onboarding
+- **Onboarding wizard** otomatis untuk user baru — pilih bahasa, persona, dan
+  model default dalam 3 langkah.
+- **Settings panel** lewat `/settings` atau tombol ⚙️ Settings: model, persona,
+  bahasa UI, custom prompt, statistik usage.
+- **Multi-bahasa UI** (Indonesia / English) — beberapa label menyesuaikan
+  bahasa user.
+
+### Stats & Admin
+- **`/stats`** — sesi, jumlah pesan diproses, estimasi token in/out per user.
+- **Admin commands** (set `ADMIN_TELEGRAM_IDS` di `.env`):
+  - `/admin` — stats global (users, sessions, messages).
+  - `/broadcast <pesan>` — kirim pengumuman ke semua user yang pernah pakai bot.
 
 ## Prasyarat
 
@@ -46,7 +82,7 @@ cp .env.example .env
 # Edit .env, isi TELEGRAM_BOT_TOKEN dan TANS_AI_API_KEY
 ```
 
-Isi `.env`:
+Isi `.env` (lihat `.env.example` untuk daftar lengkap):
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF-your-token-here
@@ -55,72 +91,64 @@ TANS_AI_API_KEY=tans_your_api_key_here
 TANS_AI_DEFAULT_MODEL=gpt-4o
 HISTORY_MAX_MESSAGES=20
 TANS_AI_TIMEOUT=60
+AUTO_TITLE=1
+# ADMIN_TELEGRAM_IDS=123456789
 ```
 
 ## Menjalankan
-
-Pastikan server Tans AI sudah jalan di `localhost:20130`, lalu:
 
 ```bash
 python bot.py
 ```
 
-Bot akan menggunakan **long polling**, jadi tidak perlu expose port apa pun
-ke internet. Buka Telegram, cari bot kamu, lalu kirim `/start`.
+Bot menggunakan **long polling**, jadi tidak perlu expose port apa pun. Buka
+Telegram, cari bot kamu, kirim `/start`. User baru akan dipandu lewat
+onboarding wizard (3 langkah).
 
-## Cara pakai (dari Telegram)
-
-### Lewat tombol (persistent reply keyboard)
-
-Setelah `/start`, akan muncul tombol di bawah area ketik:
-
-| Tombol | Aksi |
-|---|---|
-| 📝 New Chat | Mulai sesi percakapan baru kosong (sesi lama tetap di History) |
-| 📚 History | Lihat & lanjutkan riwayat percakapan |
-| 🧠 Pilih Model | Tampilkan daftar model (lalu tap tombol model untuk ganti) |
-| 🔌 Status | Cek koneksi & validitas API key ke Tans AI |
-| ℹ️ Bantuan | Tampilkan daftar tombol/perintah |
-| 🧹 Reset Chat | Hapus sesi aktif sekarang (juga hilang dari History) |
-
-### Lewat command (alternatif teks)
+## Daftar Command
 
 | Perintah | Keterangan |
 |---|---|
-| `/start` | Tampilkan ulang tombol + lihat model aktif |
+| `/start` | Tampilkan ulang keyboard, lihat status pengaturan |
 | `/help` | Daftar tombol & perintah |
-| `/status` | Cek koneksi & validitas API key ke Tans AI |
-| `/models` | Tampilkan daftar model dari Tans AI |
-| `/model gpt-4o` | Ganti model aktif kamu ke `gpt-4o` |
-| `/model` | Tampilkan model aktif kamu saat ini |
-| `/new` | Mulai sesi percakapan baru |
-| `/history` | Lihat riwayat percakapan |
-| `/reset` | Hapus sesi aktif sekarang |
-| (pesan biasa) | Kirim ke AI dan terima balasan |
+| `/new` | Mulai sesi baru |
+| `/history` | Lihat riwayat (dengan pagination, pin, rename, dll) |
+| `/quick` | Pilih template quick prompt |
+| `/persona` | Ganti gaya jawaban AI |
+| `/models` | Daftar model + ganti via tombol |
+| `/model <nama>` | Ganti model lewat teks |
+| `/settings` | Panel preferences |
+| `/find <kata>` / `/search <kata>` | Cari di riwayat |
+| `/export` | Export sesi aktif sebagai file `.md` |
+| `/stats` | Statistik penggunaan kamu |
+| `/status` | Cek koneksi ke Tans AI |
+| `/reset` | Hapus sesi aktif |
+| `/cancel` | Batalkan aksi pending (rename, quick prompt input, dll) |
+| `/admin` | (admin) Stats global |
+| `/broadcast <msg>` | (admin) Kirim pengumuman ke semua user |
 
-### Bagaimana session/history bekerja
+## Cara kerja history & persona
 
-- Setiap pesan kamu masuk ke "sesi aktif". Kalau belum ada, sesi baru otomatis dibuat.
-- Judul sesi diambil dari pesan pertama kamu (dipotong ke 40 karakter).
-- Tap **📝 New Chat** → buat sesi baru kosong, sesi lama tetap di History.
-- Tap **📚 History** → daftar sesi (latest first, max 20). Tap salah satu untuk lanjutkan.
-- Saat lanjut sesi lama, AI tetap dapat konteks dari `HISTORY_MAX_MESSAGES` pesan terakhir.
-- Tap **🧹 Reset Chat** → hapus sesi aktif sekarang (juga hilang dari History).
-- Sesi tersimpan di `chat_history.db` (SQLite, di folder bot). Tidak hilang saat bot restart.
+- Setiap pesan masuk ke "sesi aktif". Kalau belum ada, sesi baru otomatis dibuat.
+- Judul sesi awalnya dari pesan pertama, lalu di-replace otomatis oleh AI
+  (kalau `AUTO_TITLE=1`).
+- Tap **📝 New Chat** → buat sesi baru, sesi lama tetap di History.
+- Tap **📚 History** → lihat sesi, lalu **⋯** untuk menu rename/pin/archive/export.
+- Tap **🎭 Persona** → ganti gaya AI (Coder, Writer, Translator, dll). Persona
+  per-user di-default, persona per-session juga di-set saat sesi dibuat.
+- **🧹 Reset Chat** → hapus sesi aktif sekarang (juga hilang dari History).
+- Semua data tersimpan di `chat_history.db` (SQLite, di folder bot).
 
 ## Catatan teknis
 
 - Endpoint `/api/v1/chat` Tans AI menerima `{"message": "...", "model": "..."}`
-  sebagai body. Bot ini menyusun riwayat percakapan menjadi satu prompt
-  bergaya `User: ...\nAssistant: ...` agar AI tetap dapat konteks meskipun
-  endpoint hanya menerima satu field `message`.
-- Riwayat disimpan di memori proses (RAM). Kalau bot di-restart, riwayat
-  hilang. Untuk persistence, ganti `USER_HISTORY` dengan storage seperti
-  SQLite/Redis.
-- Parser response cukup permisif (mendukung field `reply`, `response`,
-  `message`, `content`, `choices[0].message.content`, dll). Kalau Tans AI
-  pakai format berbeda, sesuaikan `TansAIClient._extract_reply` di
-  `tans_client.py`.
+  sebagai body. Bot menyusun riwayat percakapan menjadi satu prompt
+  bergaya `System: ...\nUser: ...\nAssistant: ...` agar AI tetap dapat konteks
+  dan persona meskipun endpoint hanya menerima satu field `message`.
+- Parser response permisif (mendukung field `reply`, `response`, `message`,
+  `content`, `choices[0].message.content`, dll).
+- Token tracker memakai estimasi cepat (`len(text) // 4`), bukan tokenizer
+  resmi — angkanya cuma indikatif.
 
 ## Troubleshooting
 
@@ -132,19 +160,23 @@ Setelah `/start`, akan muncul tombol di bawah area ketik:
     -H "Content-Type: application/json" \
     -d '{"message":"Hi","model":"gpt-4o"}'
   ```
-- **"HTTP 401 / 403"** — API key salah atau sudah di-revoke. Generate ulang
-  dari halaman API Gateway Tans AI.
-- **"Format response Tans AI tidak dikenali"** — kirim contoh response
-  mentah, lalu sesuaikan `_extract_reply` di `tans_client.py`.
+- **"HTTP 401 / 403"** — API key salah atau sudah di-revoke. Generate ulang.
+- **"Format response Tans AI tidak dikenali"** — kirim contoh response mentah,
+  lalu sesuaikan `_extract_reply` di `tans_client.py`.
 
 ## Struktur file
 
 ```
 telegram-tans-ai-bot/
-├── bot.py            # Entry point + Telegram handlers
-├── tans_client.py    # HTTP client untuk Tans AI API
-├── db.py             # SQLite helpers (sessions + messages)
-├── chat_history.db   # SQLite DB (auto-dibuat saat run pertama; di-gitignore)
+├── bot.py              # Entry point + Telegram handlers
+├── tans_client.py      # HTTP client untuk Tans AI API
+├── db.py               # SQLite helpers (sessions, messages, prefs, usage)
+├── ui.py               # Keyboard builders + callback prefixes
+├── personas.py         # System prompt presets
+├── quick_prompts.py    # Quick-prompt templates
+├── streaming.py        # "Typing animation" placeholder helper
+├── markdown_utils.py   # Markdown → Telegram HTML converter
+├── chat_history.db     # SQLite DB (auto-dibuat saat run pertama; di-gitignore)
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
