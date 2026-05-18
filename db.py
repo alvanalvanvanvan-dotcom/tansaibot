@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     custom_system_prompt TEXT NOT NULL DEFAULT '',
     ui_language          TEXT NOT NULL DEFAULT 'id',
     onboarded            INTEGER NOT NULL DEFAULT 0,
+    status               TEXT NOT NULL DEFAULT 'active',
+    display_name         TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -75,6 +77,22 @@ _SESSION_MIGRATIONS: list[tuple[str, str]] = [
     ("archived", "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
 ]
 
+_USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
+    (
+        "status",
+        "ALTER TABLE user_preferences ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    ),
+    (
+        "display_name",
+        "ALTER TABLE user_preferences ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    ),
+]
+
+# Valid status values for user access.
+STATUS_ACTIVE = "active"
+STATUS_WAITLIST = "waitlist"
+STATUS_BANNED = "banned"
+
 
 @dataclass(frozen=True)
 class Session:
@@ -104,6 +122,8 @@ class UserPrefs:
     custom_system_prompt: str
     ui_language: str
     onboarded: bool
+    status: str
+    display_name: str
     created_at: str
     updated_at: str
 
@@ -143,11 +163,19 @@ def _apply_session_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
 
 
+def _apply_user_prefs_migrations(conn: sqlite3.Connection) -> None:
+    existing = _existing_columns(conn, "user_preferences")
+    for column, ddl in _USER_PREFS_MIGRATIONS:
+        if column not in existing:
+            conn.execute(ddl)
+
+
 def _init_db_sync(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with _connect(path) as conn:
         conn.executescript(_SCHEMA)
         _apply_session_migrations(conn)
+        _apply_user_prefs_migrations(conn)
 
 
 async def init_db(path: str | Path) -> None:
@@ -482,6 +510,7 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         ).fetchone()
     if row is None:
         return None
+    keys = row.keys()
     return UserPrefs(
         user_id=row["user_id"],
         default_model=row["default_model"],
@@ -489,6 +518,8 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         custom_system_prompt=row["custom_system_prompt"],
         ui_language=row["ui_language"],
         onboarded=bool(row["onboarded"]),
+        status=row["status"] if "status" in keys else STATUS_ACTIVE,
+        display_name=row["display_name"] if "display_name" in keys else "",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -507,6 +538,8 @@ def _upsert_user_prefs_sync(
     custom_system_prompt: str | None,
     ui_language: str | None,
     onboarded: bool | None,
+    status: str | None,
+    display_name: str | None,
 ) -> None:
     now = _now()
     with _connect(path) as conn:
@@ -516,8 +549,9 @@ def _upsert_user_prefs_sync(
         if existing is None:
             conn.execute(
                 "INSERT INTO user_preferences (user_id, default_model, persona, "
-                "custom_system_prompt, ui_language, onboarded, created_at, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "custom_system_prompt, ui_language, onboarded, status, "
+                "display_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     default_model or "",
@@ -525,6 +559,8 @@ def _upsert_user_prefs_sync(
                     custom_system_prompt or "",
                     ui_language or "id",
                     1 if onboarded else 0,
+                    status or STATUS_ACTIVE,
+                    display_name or "",
                     now,
                     now,
                 ),
@@ -547,6 +583,12 @@ def _upsert_user_prefs_sync(
         if onboarded is not None:
             fields.append("onboarded = ?")
             params.append(1 if onboarded else 0)
+        if status is not None:
+            fields.append("status = ?")
+            params.append(status)
+        if display_name is not None:
+            fields.append("display_name = ?")
+            params.append(display_name)
         if not fields:
             return
         fields.append("updated_at = ?")
@@ -567,6 +609,8 @@ async def upsert_user_prefs(
     custom_system_prompt: str | None = None,
     ui_language: str | None = None,
     onboarded: bool | None = None,
+    status: str | None = None,
+    display_name: str | None = None,
 ) -> None:
     await asyncio.to_thread(
         _upsert_user_prefs_sync,
@@ -577,7 +621,45 @@ async def upsert_user_prefs(
         custom_system_prompt=custom_system_prompt,
         ui_language=ui_language,
         onboarded=onboarded,
+        status=status,
+        display_name=display_name,
     )
+
+
+# --- User access status -----------------------------------------------------
+
+def _list_users_by_status_sync(
+    path: Path, status: str, limit: int
+) -> list[tuple[int, str, str]]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT user_id, display_name, created_at FROM user_preferences "
+            "WHERE status = ? ORDER BY created_at ASC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return [
+        (int(r["user_id"]), r["display_name"] or "", r["created_at"]) for r in rows
+    ]
+
+
+async def list_users_by_status(
+    path: str | Path, status: str, limit: int = 200
+) -> list[tuple[int, str, str]]:
+    return await asyncio.to_thread(
+        _list_users_by_status_sync, Path(path), status, limit
+    )
+
+
+def _count_users_by_status_sync(path: Path) -> dict[str, int]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS c FROM user_preferences GROUP BY status"
+        ).fetchall()
+    return {r["status"]: int(r["c"]) for r in rows}
+
+
+async def count_users_by_status(path: str | Path) -> dict[str, int]:
+    return await asyncio.to_thread(_count_users_by_status_sync, Path(path))
 
 
 def _list_user_ids_sync(path: Path) -> list[int]:
