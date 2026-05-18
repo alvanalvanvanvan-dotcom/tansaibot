@@ -74,6 +74,7 @@ ONBOARD_PREFIX = "onbd:"
 LANG_PREFIX = "lang:"
 EXPORT_PREFIX = "export:"
 SEARCH_PREFIX = "search:"
+FOLLOWUP_PREFIX = "fup:"
 
 
 # --- Inline-keyboard builders ----------------------------------------------
@@ -232,22 +233,45 @@ def confirm_delete_keyboard(session_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def reply_actions_keyboard(session_id: int) -> InlineKeyboardMarkup:
-    """Inline buttons that appear under each AI reply."""
-    return InlineKeyboardMarkup(
+def reply_actions_keyboard(
+    session_id: int,
+    *,
+    followups: list[str] | None = None,
+    followup_msg_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    """Inline buttons that appear under each AI reply.
+
+    When ``followups`` is provided we render up to 3 quick follow-up buttons.
+    Their callback only carries the index — the actual text is looked up from
+    ``chat_data`` keyed by ``followup_msg_id`` (the message they're attached
+    to).
+    """
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                InlineKeyboardButton(
-                    text="\U0001f504 Regenerate",
-                    callback_data=f"{REGEN_PREFIX}{session_id}",
-                ),
-                InlineKeyboardButton(
-                    text="\U0001f4e5 Export",
-                    callback_data=f"{EXPORT_PREFIX}{session_id}",
-                ),
-            ]
+            InlineKeyboardButton(
+                text="\U0001f504 Regenerate",
+                callback_data=f"{REGEN_PREFIX}{session_id}",
+            ),
+            InlineKeyboardButton(
+                text="\U0001f4e5 Export",
+                callback_data=f"{EXPORT_PREFIX}{session_id}",
+            ),
         ]
-    )
+    ]
+    if followups and followup_msg_id is not None:
+        for idx, text in enumerate(followups[:3]):
+            label = text.strip()
+            if len(label) > 48:
+                label = label[:47] + "\u2026"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"\u2192 {label}",
+                        callback_data=f"{FOLLOWUP_PREFIX}{followup_msg_id}:{idx}",
+                    )
+                ]
+            )
+    return InlineKeyboardMarkup(rows)
 
 
 def personas_keyboard(active_key: str, *, for_session: bool = False) -> InlineKeyboardMarkup:

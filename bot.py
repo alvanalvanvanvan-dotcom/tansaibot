@@ -11,8 +11,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InlineQueryResultsButton,
+    InputTextMessageContent,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
@@ -23,16 +28,20 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
 
 import db
+import follow_ups
 import personas
 import quick_prompts
 import rate_limiter
 import streaming
+import summarizer
 import ui
+import voice as voice_mod
 from markdown_utils import chunk_for_telegram, to_telegram_html
 from tans_client import TansAIClient, TansAIError
 
@@ -84,6 +93,18 @@ def _config() -> dict[str, str | int | float]:
         "rate_limit_per_minute": int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
         "rate_limit_per_day": int(os.getenv("RATE_LIMIT_PER_DAY", "500")),
         "waitlist_mode": os.getenv("WAITLIST_MODE", "0") in ("1", "true", "True"),
+        "follow_ups_enabled": os.getenv("FOLLOW_UPS_ENABLED", "1")
+        not in ("0", "false", "False"),
+        "summarization_threshold": int(os.getenv("SUMMARIZATION_THRESHOLD", "24")),
+        "summarization_keep_last": int(os.getenv("SUMMARIZATION_KEEP_LAST", "10")),
+        "summarization_delta": int(os.getenv("SUMMARIZATION_DELTA", "12")),
+        "voice_api_base": os.getenv("VOICE_API_BASE", "https://api.openai.com/v1"),
+        "voice_api_key": os.getenv("VOICE_API_KEY", ""),
+        "voice_stt_model": os.getenv("VOICE_STT_MODEL", "whisper-1"),
+        "voice_tts_model": os.getenv("VOICE_TTS_MODEL", "tts-1"),
+        "voice_tts_voice": os.getenv("VOICE_TTS_VOICE", "alloy"),
+        "voice_timeout": float(os.getenv("VOICE_TIMEOUT", "60")),
+        "bot_username": os.getenv("BOT_USERNAME", ""),
     }
 
 
@@ -277,7 +298,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     assert update.message is not None
     db_path: str = context.application.bot_data["db_path"]
     default_model: str = context.application.bot_data["default_model"]
-    prefs = await _ensure_prefs(db_path, update.effective_user.id, default_model)
+    prefs = await _ensure_prefs(
+        db_path,
+        update.effective_user.id,
+        default_model,
+        waitlist_mode=_waitlist_mode(context),
+        admin_ids=_admin_ids(context),
+        display_name=_display_name_from_update(update),
+    )
 
     if not prefs.onboarded:
         await _start_onboarding(update, context, prefs)
@@ -1479,6 +1507,187 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- Chat -------------------------------------------------------------------
 
+FOLLOWUP_CACHE = "fup_cache"
+FOLLOWUP_CACHE_MAX = 20
+
+
+def _store_followups(
+    context: ContextTypes.DEFAULT_TYPE, message_id: int, suggestions: list[str]
+) -> None:
+    if context.chat_data is None:
+        return
+    cache = context.chat_data.setdefault(FOLLOWUP_CACHE, {})
+    cache[int(message_id)] = list(suggestions[:3])
+    # Bound memory: trim oldest entries.
+    if len(cache) > FOLLOWUP_CACHE_MAX:
+        for key in sorted(cache.keys())[: len(cache) - FOLLOWUP_CACHE_MAX]:
+            cache.pop(key, None)
+
+
+def _get_followups(
+    context: ContextTypes.DEFAULT_TYPE, message_id: int
+) -> list[str]:
+    if context.chat_data is None:
+        return []
+    return list(context.chat_data.get(FOLLOWUP_CACHE, {}).get(int(message_id), []))
+
+
+async def _prepare_context_messages(
+    db_path: str,
+    client: TansAIClient,
+    session: db.Session,
+    *,
+    threshold: int,
+    keep_last: int,
+    delta: int,
+    history_max: int,
+    language: str,
+    model: str,
+) -> tuple[str, list[db.Message]]:
+    """Return (summary_or_empty, recent_messages) to feed into the prompt.
+
+    Triggers a background summary refresh when the session has piled up too
+    many new messages since the last snapshot.
+    """
+    if threshold <= 0:
+        history = await db.get_messages(db_path, session.id, limit=history_max)
+        return "", history
+
+    total = await db.count_messages(db_path, session.id)
+    if total < threshold:
+        history = await db.get_messages(db_path, session.id, limit=history_max)
+        return session.summary, history
+
+    all_messages = await db.get_all_messages(db_path, session.id)
+    summarized_count = 0
+    if session.summary and session.summary_until_id:
+        for i, m in enumerate(all_messages):
+            if m.id > session.summary_until_id:
+                summarized_count = i
+                break
+        else:
+            summarized_count = len(all_messages)
+
+    if summarizer.should_summarize(
+        total_messages=total,
+        summarized_count=summarized_count,
+        threshold=threshold,
+        keep_last=keep_last,
+        delta=delta,
+    ):
+        to_summarize = summarizer.messages_to_summarize(
+            all_messages, summarized_count=summarized_count, keep_last=keep_last
+        )
+        if to_summarize:
+            new_summary = await summarizer.generate_summary(
+                client,
+                model=model,
+                messages=to_summarize,
+                previous_summary=session.summary,
+                language=language,
+            )
+            if new_summary and new_summary != session.summary:
+                last_id = to_summarize[-1].id
+                await db.update_session_summary(
+                    db_path, session.id, new_summary, last_id
+                )
+                logger.info(
+                    "Session %s summarized up to message %s (len=%d)",
+                    session.id,
+                    last_id,
+                    len(new_summary),
+                )
+                recent = all_messages[-keep_last:]
+                return new_summary, recent
+    if session.summary and session.summary_until_id:
+        recent = all_messages[-keep_last:]
+        return session.summary, recent
+    history = await db.get_messages(db_path, session.id, limit=history_max)
+    return "", history
+
+
+def _build_prompt_with_summary(
+    persona_prompt: str,
+    summary: str,
+    history: list[db.Message],
+    new_message: str,
+) -> str:
+    lines: list[str] = []
+    if persona_prompt:
+        lines.append(f"System: {persona_prompt}")
+    if summary:
+        lines.append(f"Conversation summary so far: {summary}")
+    for msg in history:
+        prefix = "User" if msg.role == "user" else "Assistant"
+        lines.append(f"{prefix}: {msg.content}")
+    lines.append(f"User: {new_message}")
+    lines.append("Assistant:")
+    return "\n".join(lines) if lines else new_message
+
+
+async def _maybe_send_voice_reply(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    text: str,
+    prefs: db.UserPrefs,
+) -> None:
+    if not prefs.tts_enabled:
+        return
+    vc: voice_mod.VoiceClient | None = context.application.bot_data.get(
+        "voice_client"
+    )
+    if vc is None or not vc.enabled:
+        return
+    try:
+        audio = await vc.synthesize(text)
+    except voice_mod.VoiceError as exc:
+        logger.debug("TTS failed: %s", exc)
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("Unexpected TTS failure")
+        return
+    try:
+        await context.bot.send_voice(chat_id=chat_id, voice=audio)
+    except Exception:  # noqa: BLE001
+        logger.exception("send_voice failed")
+
+
+async def _attach_followups(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    placeholder_message,
+    sid: int,
+    rendered_html: str,
+    fallback_text: str,
+    last_user: str,
+    last_assistant: str,
+    language: str,
+    model: str,
+) -> None:
+    """Generate 3 follow-up suggestions and re-render the reply with them."""
+    client: TansAIClient = context.application.bot_data["tans_client"]
+    suggestions = await follow_ups.generate(
+        client,
+        model=model,
+        last_user_message=last_user,
+        last_assistant_message=last_assistant,
+        language=language,
+    )
+    if not suggestions:
+        return
+    _store_followups(context, placeholder_message.message_id, suggestions)
+    markup = ui.reply_actions_keyboard(
+        sid,
+        followups=suggestions,
+        followup_msg_id=placeholder_message.message_id,
+    )
+    try:
+        await placeholder_message.edit_reply_markup(reply_markup=markup)
+    except BadRequest:
+        logger.debug("edit_reply_markup failed", exc_info=True)
+
+
 async def _send_ai_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1499,6 +1708,18 @@ async def _send_ai_reply(
     default_model: str = context.application.bot_data["default_model"]
     history_max: int = context.application.bot_data["history_max"]
     auto_title: bool = context.application.bot_data["auto_title"]
+    follow_ups_enabled: bool = context.application.bot_data.get(
+        "follow_ups_enabled", True
+    )
+    summarization_threshold: int = context.application.bot_data.get(
+        "summarization_threshold", 0
+    )
+    summarization_keep_last: int = context.application.bot_data.get(
+        "summarization_keep_last", 10
+    )
+    summarization_delta: int = context.application.bot_data.get(
+        "summarization_delta", 12
+    )
     prefs = await _ensure_prefs(db_path, user_id, default_model)
     session = await db.get_session(db_path, sid)
     if session is None:
@@ -1541,10 +1762,20 @@ async def _send_ai_reply(
     typing_task = asyncio.create_task(_keep_typing())
 
     try:
-        history = await db.get_messages(db_path, sid, limit=history_max)
-        # If we're regenerating, the popped user message is `user_message`
-        # and the history we got back does NOT include it.
-        prompt = _build_prompt(persona_prompt, history if persist_user else history, user_message)
+        summary, history = await _prepare_context_messages(
+            db_path,
+            client,
+            session,
+            threshold=summarization_threshold,
+            keep_last=summarization_keep_last,
+            delta=summarization_delta,
+            history_max=history_max,
+            language=prefs.ui_language,
+            model=model,
+        )
+        prompt = _build_prompt_with_summary(
+            persona_prompt, summary, history, user_message
+        )
         try:
             reply = await client.chat(message=prompt, model=model)
         except TansAIError as exc:
@@ -1579,6 +1810,7 @@ async def _send_ai_reply(
         session_id=sid,
         model=model,
         tokens_in=_estimate_tokens(user_message)
+        + _estimate_tokens(summary)
         + sum(_estimate_tokens(m.content) for m in history),
         tokens_out=_estimate_tokens(reply),
     )
@@ -1608,6 +1840,25 @@ async def _send_ai_reply(
             )
         except BadRequest:
             await target.reply_text(extra)
+
+    if follow_ups_enabled:
+        asyncio.create_task(
+            _attach_followups(
+                context,
+                placeholder_message=placeholder,
+                sid=sid,
+                rendered_html=rendered_first,
+                fallback_text=chunks[0],
+                last_user=user_message,
+                last_assistant=reply,
+                language=prefs.ui_language,
+                model=model,
+            )
+        )
+
+    asyncio.create_task(
+        _maybe_send_voice_reply(context, chat_id=chat_id, text=reply, prefs=prefs)
+    )
 
     if (
         auto_title
@@ -1728,6 +1979,261 @@ async def regenerate_callback(
     )
 
 
+async def followup_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None or query.data is None or update.effective_user is None:
+        return
+    if not query.data.startswith(ui.FOLLOWUP_PREFIX):
+        await query.answer()
+        return
+    payload = query.data[len(ui.FOLLOWUP_PREFIX):]
+    try:
+        msg_id_str, idx_str = payload.split(":", 1)
+        msg_id = int(msg_id_str)
+        idx = int(idx_str)
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+    suggestions = _get_followups(context, msg_id)
+    if not suggestions or idx < 0 or idx >= len(suggestions):
+        await query.answer("Saran sudah kedaluwarsa.", show_alert=True)
+        return
+    suggestion_text = suggestions[idx]
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None:
+        await query.answer()
+        return
+    if deny:
+        await query.answer(re.sub(r"<[^>]+>", "", deny), show_alert=True)
+        return
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
+    sid = await _get_or_create_active_session(
+        db_path, user_id, model, prefs.persona or "default", context
+    )
+    await query.answer()
+    if query.message is not None:
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=ui.reply_actions_keyboard(sid)
+            )
+        except BadRequest:
+            pass
+    if update.effective_chat is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"\u2192 {suggestion_text}",
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("echo follow-up failed", exc_info=True)
+    await _send_ai_reply(
+        update, context, sid=sid, user_message=suggestion_text, persist_user=True
+    )
+
+
+# --- /tts toggle ------------------------------------------------------------
+
+async def tts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    user_id = update.effective_user.id
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+    vc: voice_mod.VoiceClient | None = context.application.bot_data.get(
+        "voice_client"
+    )
+    if vc is None or not vc.enabled:
+        await update.message.reply_text(
+            "Voice belum dikonfigurasi di bot ini. Admin harus set VOICE_API_KEY."
+        )
+        return
+    args = context.args or []
+    if args and args[0].lower() in ("on", "1", "true", "enable"):
+        new_value = True
+    elif args and args[0].lower() in ("off", "0", "false", "disable"):
+        new_value = False
+    else:
+        new_value = not prefs.tts_enabled
+    await db.upsert_user_prefs(db_path, user_id, tts_enabled=new_value)
+    status = "AKTIF \U0001f50a" if new_value else "NONAKTIF \U0001f507"
+    await update.message.reply_text(
+        f"Text-to-speech sekarang: {status}.\n"
+        "Setiap jawaban AI akan dikirim juga sebagai voice message."
+        if new_value
+        else f"Text-to-speech sekarang: {status}.\nJawaban AI hanya teks."
+    )
+
+
+# --- Voice messages (STT) ---------------------------------------------------
+
+async def voice_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if update.message is None or update.effective_user is None:
+        return
+    msg = update.message
+    media = msg.voice or msg.audio
+    if media is None:
+        return
+    vc: voice_mod.VoiceClient | None = context.application.bot_data.get(
+        "voice_client"
+    )
+    if vc is None or not vc.enabled:
+        await msg.reply_text(
+            "Voice belum dikonfigurasi. Kirim pertanyaan dalam bentuk teks ya."
+        )
+        return
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None:
+        return
+    if deny:
+        await msg.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    file = await context.bot.get_file(media.file_id)
+    audio_bytes = await file.download_as_bytearray()
+    suffix = ".ogg" if msg.voice is not None else ".m4a"
+    try:
+        transcript = await vc.transcribe(bytes(audio_bytes), filename=f"voice{suffix}")
+    except voice_mod.VoiceError as exc:
+        await msg.reply_text(f"Gagal transkrip: {exc}")
+        return
+    transcript = (transcript or "").strip()
+    if not transcript:
+        await msg.reply_text("Maaf, tidak ada teks yang berhasil ditranskrip.")
+        return
+
+    await msg.reply_text(
+        f"\U0001f3a4 <i>{ui.escape(transcript)}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
+    sid = await _get_or_create_active_session(
+        db_path, user_id, model, prefs.persona or "default", context
+    )
+    await _send_ai_reply(
+        update, context, sid=sid, user_message=transcript, persist_user=True
+    )
+
+
+# --- Inline mode ------------------------------------------------------------
+
+async def inline_query(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    iq = update.inline_query
+    if iq is None or update.effective_user is None:
+        return
+    query_text = (iq.query or "").strip()
+    if len(query_text) < 3:
+        await iq.answer(
+            results=[],
+            cache_time=1,
+            is_personal=True,
+            button=InlineQueryResultsButton(
+                text="Tulis pertanyaan minimal 3 huruf",
+                start_parameter="inline",
+            ),
+        )
+        return
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    rl: rate_limiter.RateLimiter = context.application.bot_data["rate_limiter"]
+    user_id = update.effective_user.id
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    if prefs.status == db.STATUS_BANNED:
+        await iq.answer(
+            results=[],
+            cache_time=1,
+            is_personal=True,
+            button=InlineQueryResultsButton(
+                text="Akses Anda diblokir admin.",
+                start_parameter="banned",
+            ),
+        )
+        return
+    if prefs.status == db.STATUS_WAITLIST:
+        await iq.answer(
+            results=[],
+            cache_time=1,
+            is_personal=True,
+            button=InlineQueryResultsButton(
+                text="Akun Anda masih waitlist. Buka chat untuk info.",
+                start_parameter="waitlist",
+            ),
+        )
+        return
+    rl_result = await rl.check_and_consume(user_id)
+    if not rl_result.allowed:
+        await iq.answer(
+            results=[],
+            cache_time=2,
+            is_personal=True,
+            button=InlineQueryResultsButton(
+                text="Rate limit tercapai, coba lagi nanti.",
+                start_parameter="rate",
+            ),
+        )
+        return
+
+    client: TansAIClient = context.application.bot_data["tans_client"]
+    model = _active_model(prefs, default_model)
+    persona_prompt = personas.resolve_system_prompt(
+        prefs.persona or "default", prefs.custom_system_prompt
+    )
+    prompt = _build_prompt_with_summary(persona_prompt, "", [], query_text)
+    try:
+        reply = await asyncio.wait_for(
+            client.chat(message=prompt, model=model), timeout=20.0
+        )
+    except (asyncio.TimeoutError, TansAIError):
+        await iq.answer(
+            results=[],
+            cache_time=1,
+            is_personal=True,
+            button=InlineQueryResultsButton(
+                text="AI lambat / error. Coba lagi.",
+                start_parameter="err",
+            ),
+        )
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("inline query failed")
+        return
+    reply = (reply or "").strip() or "(AI mengembalikan response kosong.)"
+    preview = reply.replace("\n", " ")[:120]
+    result = InlineQueryResultArticle(
+        id=f"q{abs(hash(query_text)) % 10**12}",
+        title=preview or query_text,
+        description=query_text[:80],
+        input_message_content=InputTextMessageContent(
+            message_text=reply[:4000]
+        ),
+    )
+    try:
+        await iq.answer(results=[result], cache_time=5, is_personal=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("answer_inline_query failed")
+
+
 # --- Auto-title -------------------------------------------------------------
 
 async def _auto_generate_title(
@@ -1758,6 +2264,36 @@ async def _auto_generate_title(
 
 # --- Bootstrap --------------------------------------------------------------
 
+PUBLIC_BOT_COMMANDS: list[tuple[str, str]] = [
+    ("start", "Mulai bot & buka onboarding"),
+    ("new", "Mulai chat baru"),
+    ("history", "Lihat & kelola riwayat sesi"),
+    ("search", "Cari di riwayat chat"),
+    ("models", "Pilih model AI"),
+    ("persona", "Pilih persona / mode AI"),
+    ("quick", "Template prompt cepat"),
+    ("settings", "Buka menu pengaturan"),
+    ("export", "Export sesi ke Markdown"),
+    ("tts", "On/off voice reply (TTS)"),
+    ("stats", "Statistik penggunaan Anda"),
+    ("status", "Cek koneksi ke Tans AI"),
+    ("reset", "Reset preferensi ke default"),
+    ("help", "Bantuan & daftar perintah"),
+    ("cancel", "Batalkan operasi yang berjalan"),
+]
+
+
+async def _publish_bot_commands(application: Application) -> None:
+    commands = [BotCommand(name, desc) for name, desc in PUBLIC_BOT_COMMANDS]
+    try:
+        await application.bot.set_my_commands(
+            commands, scope=BotCommandScopeAllPrivateChats()
+        )
+        logger.info("Published %d bot commands via setMyCommands", len(commands))
+    except Exception:  # noqa: BLE001
+        logger.exception("set_my_commands failed")
+
+
 async def _post_init(application: Application) -> None:
     cfg = application.bot_data
     db_path = str(cfg["db_path"])
@@ -1782,13 +2318,37 @@ async def _post_init(application: Application) -> None:
             "Rate limiter: %s/min, %s/day", rl.per_minute, rl.per_day
         )
     if cfg.get("waitlist_mode"):
-        logger.info("WAITLIST_MODE on — new users default to 'waitlist' status.")
+        logger.info("WAITLIST_MODE on \u2014 new users default to 'waitlist' status.")
+    voice_cfg = voice_mod.VoiceConfig(
+        api_base=str(cfg.get("voice_api_base", "")),
+        api_key=str(cfg.get("voice_api_key", "")),
+        stt_model=str(cfg.get("voice_stt_model", "whisper-1")),
+        tts_model=str(cfg.get("voice_tts_model", "tts-1")),
+        tts_voice=str(cfg.get("voice_tts_voice", "alloy")),
+        timeout=float(cfg.get("voice_timeout", 60.0)),
+    )
+    vc = voice_mod.VoiceClient(voice_cfg)
+    application.bot_data["voice_client"] = vc
+    if vc.enabled:
+        logger.info(
+            "Voice enabled (base=%s, stt=%s, tts=%s/%s)",
+            voice_cfg.api_base,
+            voice_cfg.stt_model,
+            voice_cfg.tts_model,
+            voice_cfg.tts_voice,
+        )
+    else:
+        logger.info("Voice disabled (VOICE_API_KEY not set)")
+    await _publish_bot_commands(application)
 
 
 async def _post_shutdown(application: Application) -> None:
     client: TansAIClient | None = application.bot_data.get("tans_client")
     if client is not None:
         await client.aclose()
+    vc: voice_mod.VoiceClient | None = application.bot_data.get("voice_client")
+    if vc is not None:
+        await vc.aclose()
 
 
 def build_application() -> Application:
@@ -1813,6 +2373,17 @@ def build_application() -> Application:
             "rate_limit_per_minute": cfg["rate_limit_per_minute"],
             "rate_limit_per_day": cfg["rate_limit_per_day"],
             "waitlist_mode": cfg["waitlist_mode"],
+            "follow_ups_enabled": cfg["follow_ups_enabled"],
+            "summarization_threshold": cfg["summarization_threshold"],
+            "summarization_keep_last": cfg["summarization_keep_last"],
+            "summarization_delta": cfg["summarization_delta"],
+            "voice_api_base": cfg["voice_api_base"],
+            "voice_api_key": cfg["voice_api_key"],
+            "voice_stt_model": cfg["voice_stt_model"],
+            "voice_tts_model": cfg["voice_tts_model"],
+            "voice_tts_voice": cfg["voice_tts_voice"],
+            "voice_timeout": cfg["voice_timeout"],
+            "bot_username": cfg["bot_username"],
         }
     )
 
@@ -1839,6 +2410,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("waitlist", waitlist_command))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("tts", tts_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
 
     application.add_handler(
@@ -1881,6 +2453,10 @@ def build_application() -> Application:
     application.add_handler(
         CallbackQueryHandler(search_callback, pattern=f"^{ui.SEARCH_PREFIX}")
     )
+    application.add_handler(
+        CallbackQueryHandler(followup_callback, pattern=f"^{ui.FOLLOWUP_PREFIX}")
+    )
+    application.add_handler(InlineQueryHandler(inline_query))
 
     # Reply-keyboard buttons arrive as plain text — route each label to its
     # command handler BEFORE the catch-all chat handler.
@@ -1902,6 +2478,9 @@ def build_application() -> Application:
             )
         )
 
+    application.add_handler(
+        MessageHandler(filters.VOICE | filters.AUDIO, voice_message)
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_message))
     return application
 

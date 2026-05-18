@@ -15,15 +15,17 @@ from typing import Iterator
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    title       TEXT    NOT NULL DEFAULT '',
-    model       TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL,
-    updated_at  TEXT    NOT NULL,
-    persona     TEXT    NOT NULL DEFAULT '',
-    pinned      INTEGER NOT NULL DEFAULT 0,
-    archived    INTEGER NOT NULL DEFAULT 0
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id            INTEGER NOT NULL,
+    title              TEXT    NOT NULL DEFAULT '',
+    model              TEXT    NOT NULL,
+    created_at         TEXT    NOT NULL,
+    updated_at         TEXT    NOT NULL,
+    persona            TEXT    NOT NULL DEFAULT '',
+    pinned             INTEGER NOT NULL DEFAULT 0,
+    archived           INTEGER NOT NULL DEFAULT 0,
+    summary            TEXT    NOT NULL DEFAULT '',
+    summary_until_id   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     onboarded            INTEGER NOT NULL DEFAULT 0,
     status               TEXT NOT NULL DEFAULT 'active',
     display_name         TEXT NOT NULL DEFAULT '',
+    tts_enabled          INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -75,6 +78,11 @@ _SESSION_MIGRATIONS: list[tuple[str, str]] = [
     ("persona", "ALTER TABLE sessions ADD COLUMN persona TEXT NOT NULL DEFAULT ''"),
     ("pinned", "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"),
     ("archived", "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
+    ("summary", "ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''"),
+    (
+        "summary_until_id",
+        "ALTER TABLE sessions ADD COLUMN summary_until_id INTEGER NOT NULL DEFAULT 0",
+    ),
 ]
 
 _USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
@@ -85,6 +93,10 @@ _USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
     (
         "display_name",
         "ALTER TABLE user_preferences ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    ),
+    (
+        "tts_enabled",
+        "ALTER TABLE user_preferences ADD COLUMN tts_enabled INTEGER NOT NULL DEFAULT 0",
     ),
 ]
 
@@ -106,12 +118,15 @@ class Session:
     persona: str = ""
     pinned: bool = False
     archived: bool = False
+    summary: str = ""
+    summary_until_id: int = 0
 
 
 @dataclass(frozen=True)
 class Message:
     role: str
     content: str
+    id: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,7 @@ class UserPrefs:
     onboarded: bool
     status: str
     display_name: str
+    tts_enabled: bool
     created_at: str
     updated_at: str
 
@@ -219,12 +235,16 @@ def _row_to_session(row: sqlite3.Row) -> Session:
         persona=row["persona"] if "persona" in keys else "",
         pinned=bool(row["pinned"]) if "pinned" in keys else False,
         archived=bool(row["archived"]) if "archived" in keys else False,
+        summary=row["summary"] if "summary" in keys else "",
+        summary_until_id=int(row["summary_until_id"])
+        if "summary_until_id" in keys
+        else 0,
     )
 
 
 _SESSION_SELECT = (
     "SELECT s.id, s.user_id, s.title, s.model, s.created_at, s.updated_at, "
-    "       s.persona, s.pinned, s.archived, "
+    "       s.persona, s.pinned, s.archived, s.summary, s.summary_until_id, "
     "       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS cnt "
     "FROM sessions s "
 )
@@ -426,13 +446,15 @@ async def add_message(
 def _get_messages_sync(path: Path, session_id: int, limit: int) -> list[Message]:
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT role, content FROM messages "
+            "SELECT id, role, content FROM messages "
             "WHERE session_id = ? "
             "ORDER BY id DESC LIMIT ?",
             (session_id, limit),
         ).fetchall()
     rows.reverse()
-    return [Message(role=r["role"], content=r["content"]) for r in rows]
+    return [
+        Message(id=int(r["id"]), role=r["role"], content=r["content"]) for r in rows
+    ]
 
 
 async def get_messages(
@@ -446,11 +468,13 @@ async def get_messages(
 def _get_all_messages_sync(path: Path, session_id: int) -> list[Message]:
     with _connect(path) as conn:
         rows = conn.execute(
-            "SELECT role, content FROM messages "
+            "SELECT id, role, content FROM messages "
             "WHERE session_id = ? ORDER BY id ASC",
             (session_id,),
         ).fetchall()
-    return [Message(role=r["role"], content=r["content"]) for r in rows]
+    return [
+        Message(id=int(r["id"]), role=r["role"], content=r["content"]) for r in rows
+    ]
 
 
 async def get_all_messages(path: str | Path, session_id: int) -> list[Message]:
@@ -501,6 +525,42 @@ async def delete_last_assistant_message(
     )
 
 
+def _count_messages_sync(path: Path, session_id: int) -> int:
+    with _connect(path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return int(row["c"]) if row is not None else 0
+
+
+async def count_messages(path: str | Path, session_id: int) -> int:
+    return await asyncio.to_thread(_count_messages_sync, Path(path), session_id)
+
+
+def _update_session_summary_sync(
+    path: Path, session_id: int, summary: str, summary_until_id: int
+) -> None:
+    with _connect(path) as conn:
+        conn.execute(
+            "UPDATE sessions SET summary = ?, summary_until_id = ?, updated_at = ? "
+            "WHERE id = ?",
+            (summary, summary_until_id, _now(), session_id),
+        )
+
+
+async def update_session_summary(
+    path: str | Path, session_id: int, summary: str, summary_until_id: int
+) -> None:
+    await asyncio.to_thread(
+        _update_session_summary_sync,
+        Path(path),
+        session_id,
+        summary,
+        summary_until_id,
+    )
+
+
 # --- User preferences -------------------------------------------------------
 
 def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
@@ -520,6 +580,7 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         onboarded=bool(row["onboarded"]),
         status=row["status"] if "status" in keys else STATUS_ACTIVE,
         display_name=row["display_name"] if "display_name" in keys else "",
+        tts_enabled=bool(row["tts_enabled"]) if "tts_enabled" in keys else False,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -540,6 +601,7 @@ def _upsert_user_prefs_sync(
     onboarded: bool | None,
     status: str | None,
     display_name: str | None,
+    tts_enabled: bool | None,
 ) -> None:
     now = _now()
     with _connect(path) as conn:
@@ -550,8 +612,8 @@ def _upsert_user_prefs_sync(
             conn.execute(
                 "INSERT INTO user_preferences (user_id, default_model, persona, "
                 "custom_system_prompt, ui_language, onboarded, status, "
-                "display_name, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "display_name, tts_enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     default_model or "",
@@ -561,6 +623,7 @@ def _upsert_user_prefs_sync(
                     1 if onboarded else 0,
                     status or STATUS_ACTIVE,
                     display_name or "",
+                    1 if tts_enabled else 0,
                     now,
                     now,
                 ),
@@ -589,6 +652,9 @@ def _upsert_user_prefs_sync(
         if display_name is not None:
             fields.append("display_name = ?")
             params.append(display_name)
+        if tts_enabled is not None:
+            fields.append("tts_enabled = ?")
+            params.append(1 if tts_enabled else 0)
         if not fields:
             return
         fields.append("updated_at = ?")
@@ -611,6 +677,7 @@ async def upsert_user_prefs(
     onboarded: bool | None = None,
     status: str | None = None,
     display_name: str | None = None,
+    tts_enabled: bool | None = None,
 ) -> None:
     await asyncio.to_thread(
         _upsert_user_prefs_sync,
@@ -623,6 +690,7 @@ async def upsert_user_prefs(
         onboarded=onboarded,
         status=status,
         display_name=display_name,
+        tts_enabled=tts_enabled,
     )
 
 

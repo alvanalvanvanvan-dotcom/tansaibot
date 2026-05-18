@@ -62,6 +62,29 @@ quality-of-life lain — semuanya bisa diakses lewat tombol di area ketik.
   nunggu jawaban AI, jadi Telegram benar-benar nunjukin "is typing..." di
   header chat.
 
+### Futuristic
+- **Smart follow-up suggestions** — setiap jawaban AI dapat 3 tombol inline
+  "→ pertanyaan lanjutan" yang di-generate AI sesuai konteks percakapan. Tap
+  satu untuk langsung lanjut. Nonaktifkan via `FOLLOW_UPS_ENABLED=0`.
+- **Smart context summarization** — saat sesi punya banyak pesan, bot otomatis
+  meringkas pesan-pesan lama jadi satu paragraf dan menyisipkannya sebagai
+  "Summary so far:" di prompt, jadi AI tetap inget konteks panjang tanpa
+  kehabisan window. Atur lewat `SUMMARIZATION_THRESHOLD`,
+  `SUMMARIZATION_KEEP_LAST`, `SUMMARIZATION_DELTA`. Set
+  `SUMMARIZATION_THRESHOLD=0` untuk matikan.
+- **Inline mode** — ketik `@<botname> pertanyaan` di chat lain mana pun (atau
+  di group, kalau privacy mode bot di-off di BotFather) → bot bales dengan
+  jawaban AI siap-kirim. Cocok buat referensi cepat di chat lain. Aktifkan
+  inline mode di BotFather: `/setinline` → isi placeholder text.
+- **Voice input (STT) + voice output (TTS)** — kirim voice note ke bot, otomatis
+  ditranskrip pakai Whisper-compatible API lalu di-proses sebagai pertanyaan
+  teks. Toggle `/tts on` untuk dapat balasan dalam bentuk voice (TTS) juga.
+  Opsional & env-gated — biarkan `VOICE_API_KEY` kosong untuk matikan total.
+- **BotFather commands auto-setup** — bot otomatis publish daftar perintah
+  (`/start`, `/new`, `/history`, dll.) ke Telegram via `setMyCommands` saat
+  startup, jadi user tinggal tap menu "/" di Telegram untuk lihat semua
+  command yang tersedia tanpa konfigurasi manual di BotFather.
+
 ### Stats & Admin
 - **`/stats`** — sesi, jumlah pesan diproses, estimasi token in/out per user.
 - **Admin commands** (set `ADMIN_TELEGRAM_IDS` di `.env`):
@@ -136,6 +159,7 @@ onboarding wizard (3 langkah).
 | `/settings` | Panel preferences |
 | `/find <kata>` / `/search <kata>` | Cari di riwayat |
 | `/export` | Export sesi aktif sebagai file `.md` |
+| `/tts on|off` | Toggle voice reply (butuh `VOICE_API_KEY`) |
 | `/stats` | Statistik penggunaan kamu |
 | `/status` | Cek koneksi ke Tans AI |
 | `/reset` | Hapus sesi aktif |
@@ -197,6 +221,9 @@ telegram-tans-ai-bot/
 ├── quick_prompts.py    # Quick-prompt templates
 ├── streaming.py        # "Typing animation" placeholder helper
 ├── rate_limiter.py     # Per-user async token bucket (per-minute + per-day)
+├── follow_ups.py       # Generate 3 follow-up suggestions per AI reply
+├── summarizer.py       # Auto-compress long sessions into "Summary so far:"
+├── voice.py            # OpenAI-compatible STT (Whisper) + TTS client
 ├── markdown_utils.py   # Markdown → Telegram HTML converter
 ├── chat_history.db     # SQLite DB (auto-dibuat saat run pertama; di-gitignore)
 ├── requirements.txt
