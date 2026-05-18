@@ -16,6 +16,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultsButton,
     InputTextMessageContent,
     Update,
 )
@@ -297,7 +298,14 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     assert update.message is not None
     db_path: str = context.application.bot_data["db_path"]
     default_model: str = context.application.bot_data["default_model"]
-    prefs = await _ensure_prefs(db_path, update.effective_user.id, default_model)
+    prefs = await _ensure_prefs(
+        db_path,
+        update.effective_user.id,
+        default_model,
+        waitlist_mode=_waitlist_mode(context),
+        admin_ids=_admin_ids(context),
+        display_name=_display_name_from_update(update),
+    )
 
     if not prefs.onboarded:
         await _start_onboarding(update, context, prefs)
@@ -2005,8 +2013,9 @@ async def followup_callback(
     db_path: str = context.application.bot_data["db_path"]
     default_model: str = context.application.bot_data["default_model"]
     user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
     sid = await _get_or_create_active_session(
-        db_path, user_id, prefs, default_model
+        db_path, user_id, model, prefs.persona or "default", context
     )
     await query.answer()
     if query.message is not None:
@@ -2114,8 +2123,9 @@ async def voice_message(
     db_path: str = context.application.bot_data["db_path"]
     default_model: str = context.application.bot_data["default_model"]
     user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
     sid = await _get_or_create_active_session(
-        db_path, user_id, prefs, default_model
+        db_path, user_id, model, prefs.persona or "default", context
     )
     await _send_ai_reply(
         update, context, sid=sid, user_message=transcript, persist_user=True
@@ -2136,8 +2146,10 @@ async def inline_query(
             results=[],
             cache_time=1,
             is_personal=True,
-            switch_pm_text="Tulis pertanyaan minimal 3 huruf",
-            switch_pm_parameter="inline",
+            button=InlineQueryResultsButton(
+                text="Tulis pertanyaan minimal 3 huruf",
+                start_parameter="inline",
+            ),
         )
         return
 
@@ -2152,8 +2164,10 @@ async def inline_query(
             results=[],
             cache_time=1,
             is_personal=True,
-            switch_pm_text="Akses Anda diblokir admin.",
-            switch_pm_parameter="banned",
+            button=InlineQueryResultsButton(
+                text="Akses Anda diblokir admin.",
+                start_parameter="banned",
+            ),
         )
         return
     if prefs.status == db.STATUS_WAITLIST:
@@ -2161,18 +2175,22 @@ async def inline_query(
             results=[],
             cache_time=1,
             is_personal=True,
-            switch_pm_text="Akun Anda masih waitlist. Buka chat untuk info.",
-            switch_pm_parameter="waitlist",
+            button=InlineQueryResultsButton(
+                text="Akun Anda masih waitlist. Buka chat untuk info.",
+                start_parameter="waitlist",
+            ),
         )
         return
-    rl_result = rl.check_and_consume(user_id)
+    rl_result = await rl.check_and_consume(user_id)
     if not rl_result.allowed:
         await iq.answer(
             results=[],
             cache_time=2,
             is_personal=True,
-            switch_pm_text="Rate limit tercapai, coba lagi nanti.",
-            switch_pm_parameter="rate",
+            button=InlineQueryResultsButton(
+                text="Rate limit tercapai, coba lagi nanti.",
+                start_parameter="rate",
+            ),
         )
         return
 
@@ -2191,8 +2209,10 @@ async def inline_query(
             results=[],
             cache_time=1,
             is_personal=True,
-            switch_pm_text="AI lambat / error. Coba lagi.",
-            switch_pm_parameter="err",
+            button=InlineQueryResultsButton(
+                text="AI lambat / error. Coba lagi.",
+                start_parameter="err",
+            ),
         )
         return
     except Exception:  # noqa: BLE001
