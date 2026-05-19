@@ -2363,12 +2363,7 @@ async def _post_init(application: Application) -> None:
     db_path = str(cfg["db_path"])
     await db.init_db(db_path)
     logger.info("SQLite chat history at %s", db_path)
-    client = TansAIClient(
-        base_url=str(cfg["tans_base_url"]),
-        api_key=str(cfg["tans_api_key"]),
-        timeout=float(cfg["timeout"]),
-    )
-    application.bot_data["tans_client"] = client
+
     rl = rate_limiter.RateLimiter(
         per_minute=int(cfg.get("rate_limit_per_minute", 0)),
         per_day=int(cfg.get("rate_limit_per_day", 0)),
@@ -2450,6 +2445,14 @@ def build_application() -> Application:
             "bot_username": cfg["bot_username"],
         }
     )
+    
+    # Initialize TansAIClient synchronously so it's available immediately in bot_data
+    client = TansAIClient(
+        base_url=str(cfg["tans_base_url"]),
+        api_key=str(cfg["tans_api_key"]),
+        timeout=float(cfg["timeout"]),
+    )
+    application.bot_data["tans_client"] = client
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
