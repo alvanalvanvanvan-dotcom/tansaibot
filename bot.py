@@ -2673,8 +2673,6 @@ def main() -> None:
     asyncio.run(_run())
 
 
-if __name__ == "__main__":
-    main()
 
 
 # ============================================================================
@@ -3717,6 +3715,9 @@ async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await query.answer()
     payload = query.data.replace("buy_", "")  # premium_monthly | premium_once
-    
     # Send invoice
     await payment.send_premium_invoice(update, context, payload)
+
+
+if __name__ == "__main__":
+    main()
