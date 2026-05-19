@@ -1195,3 +1195,85 @@ def _mark_reminder_sent_sync(path: Path, reminder_id: int) -> None:
 
 async def mark_reminder_sent(path: str | Path, reminder_id: int) -> None:
     await asyncio.to_thread(_mark_reminder_sent_sync, Path(path), reminder_id)
+
+
+# --- Admin dashboard helpers (#17) ----------------------------------------
+
+def _global_stats_sync(path: Path) -> dict:
+    with _connect(path) as conn:
+        users = conn.execute("SELECT COUNT(*) AS c FROM user_preferences").fetchone()
+        sessions = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()
+        messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
+        tokens_row = conn.execute(
+            "SELECT COALESCE(SUM(tokens_in),0) AS ti, COALESCE(SUM(tokens_out),0) AS to2 FROM usage_log"
+        ).fetchone()
+    return {
+        "users": int(users["c"]) if users else 0,
+        "sessions": int(sessions["c"]) if sessions else 0,
+        "messages": int(messages["c"]) if messages else 0,
+        "tokens_in": int(tokens_row["ti"]) if tokens_row else 0,
+        "tokens_out": int(tokens_row["to2"]) if tokens_row else 0,
+    }
+
+
+async def global_stats(path: str | Path) -> dict:
+    """Return global bot statistics for admin dashboard."""
+    return await asyncio.to_thread(_global_stats_sync, Path(path))
+
+
+def _list_all_users_sync(path: Path, limit: int) -> list[dict]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT user_id, default_model, persona, ui_language, onboarded, "
+            "status, display_name, tts_enabled, privacy_mode, tier, created_at, updated_at "
+            "FROM user_preferences ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "user_id": int(r["user_id"]),
+            "default_model": r["default_model"],
+            "persona": r["persona"],
+            "ui_language": r["ui_language"],
+            "onboarded": bool(r["onboarded"]),
+            "status": r["status"],
+            "display_name": r["display_name"] or "",
+            "tts_enabled": bool(r["tts_enabled"]),
+            "privacy_mode": r["privacy_mode"],
+            "tier": r["tier"] if "tier" in r.keys() else "free",
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+async def list_all_users(path: str | Path, limit: int = 500) -> list[dict]:
+    """Return all users as list of dicts (for admin dashboard)."""
+    return await asyncio.to_thread(_list_all_users_sync, Path(path), limit)
+
+
+def _list_recent_sessions_sync(path: Path, limit: int) -> list[Session]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT s.id, s.user_id, s.title, s.model, s.created_at, s.updated_at, "
+            "s.persona, s.pinned, s.archived, s.summary, s.summary_until_id, "
+            "COUNT(m.id) AS message_count "
+            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+            "GROUP BY s.id ORDER BY s.updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [
+        Session(
+            id=r["id"], user_id=r["user_id"], title=r["title"], model=r["model"],
+            created_at=r["created_at"], updated_at=r["updated_at"],
+            message_count=int(r["message_count"]), persona=r["persona"] or "",
+            pinned=bool(r["pinned"]), archived=bool(r["archived"]),
+            summary=r["summary"] or "", summary_until_id=int(r["summary_until_id"]),
+        )
+        for r in rows
+    ]
+
+
+async def list_recent_sessions(path: str | Path, limit: int = 100) -> list[Session]:
+    """Return recent sessions for admin dashboard."""
+    return await asyncio.to_thread(_list_recent_sessions_sync, Path(path), limit)

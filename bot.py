@@ -79,7 +79,16 @@ from web_search import format_results_for_prompt, search as web_search_fn, summa
 from share import generate_session_html
 from webhook import get_webhook_config, is_webhook_mode
 
+# Tier L imports
+from rag import RAGStore
+from tools import get_default_registry
+from sandbox import execute_code, format_result as format_sandbox_result
+import payment
+
 logger = logging.getLogger(__name__)
+
+# Global RAG store instance (initialized in build_application)
+_rag_store: RAGStore | None = None
 
 
 # Pending-action keys stored in ``context.user_data``.
@@ -1814,8 +1823,25 @@ async def _send_ai_reply(
         prompt = _build_prompt_with_summary(
             persona_prompt, summary, history, user_message
         )
+
+        # (#32) Inject RAG Context
+        if getattr(prefs, "tier", "free") in ("premium", "admin") and _rag_store is not None:
+            rag_context = await _rag_store.query(user_id, user_message)
+            if rag_context:
+                prompt += f"\n\n{rag_context}"
+
+        # (#36) Inject Tools Spec
+        tool_registry = get_default_registry()
+        prompt += f"\n\n{tool_registry.get_spec_text()}"
+
         try:
             reply = await client.chat(message=prompt, model=model)
+            
+            # (#36) Execute tool calls in AI response
+            if "TOOL:" in reply:
+                reply = await tool_registry.execute_from_response(reply)
+                
+
         except TansAIError as exc:
             stop_event.set()
             await anim_task
@@ -2475,8 +2501,18 @@ def build_application() -> Application:
         MessageHandler(filters.PHOTO, photo_message)                             # (#31)
     )
     application.add_handler(
-        MessageHandler(filters.Document.ALL & ~filters.PHOTO, document_message) # (#31)
+        MessageHandler(filters.Document.ALL & ~filters.PHOTO, document_message) # (#31, #32)
     )
+    
+    # v2 Tier-L handlers
+    application.add_handler(CommandHandler("rag", rag_command))                 # (#32)
+    application.add_handler(CommandHandler("python", python_command))           # (#37)
+    application.add_handler(CommandHandler("premium", premium_command))         # (#47)
+    
+    from telegram.ext import PreCheckoutQueryHandler
+    application.add_handler(PreCheckoutQueryHandler(payment.handle_pre_checkout))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, payment.handle_successful_payment))
+    application.add_handler(CallbackQueryHandler(buy_premium_callback, pattern="^buy_premium_"))
 
     application.add_handler(
         CallbackQueryHandler(model_callback, pattern=f"^{ui.MODEL_PREFIX}")
@@ -2579,6 +2615,10 @@ def main() -> None:
     # (#40) Reminder scheduler
     reminder_scheduler = ReminderScheduler(application.bot)
     application.bot_data["reminder_scheduler"] = reminder_scheduler
+
+    # (#32) Initialize RAG store globally
+    global _rag_store
+    _rag_store = RAGStore(db_path)
 
     async def _run() -> None:
         await health_server.start()
@@ -3499,6 +3539,16 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     model = _active_model(prefs, default_model)
     client: TansAIClient = context.application.bot_data["tans_client"]
 
+    # (#32) RAG ingestion if premium
+    rag_msg = ""
+    if getattr(prefs, "tier", "free") in ("premium", "admin") and _rag_store is not None:
+        try:
+            chunks = await _rag_store.ingest(update.effective_user.id, doc.file_name or "file", bytes(content_bytes))
+            if chunks > 0:
+                rag_msg = f"\n<i>(Dokumen disimpan ke memori AI: {chunks} chunks)</i>"
+        except Exception as exc:
+            logger.warning("RAG ingest failed: %s", exc)
+
     prompt = f"Dokumen: {doc.file_name}\n\nIsi:\n{content}\n\nPertanyaan: {question}"
 
     try:
@@ -3510,8 +3560,163 @@ async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     from markdown_utils import to_telegram_html
     try:
         await placeholder.edit_text(
-            f"📄 <b>{ui.escape(doc.file_name or 'Dokumen')}</b>\n\n{to_telegram_html(reply)}",
+            f"📄 <b>{ui.escape(doc.file_name or 'Dokumen')}</b>\n\n{to_telegram_html(reply)}{rag_msg}",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
-        await placeholder.edit_text(reply)
+        await placeholder.edit_text(reply + rag_msg)
+
+
+# ============================================================================
+# v2 Tier-L Command Handlers
+# ============================================================================
+
+# --- #32 /rag ----------------------------------------------------------------
+
+async def rag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manage RAG documents: /rag list | /rag delete <name>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    if getattr(prefs, "tier", "free") not in ("premium", "admin"):
+        await update.message.reply_text("💎 Fitur RAG (dokumen memori) hanya untuk pengguna Premium.")
+        return
+
+    user_id = update.effective_user.id
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "📚 <b>RAG (Document Memory)</b>\n"
+            "Format:\n"
+            "<code>/rag list</code> — lihat dokumen tersimpan\n"
+            "<code>/rag delete &lt;nama_file&gt;</code> — hapus dokumen\n\n"
+            "💡 <i>Kirim file dokumen (PDF/TXT/DOCX) langsung untuk menyimpannya ke memori AI.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    cmd = args[0].lower()
+    if cmd == "list":
+        if _rag_store is None:
+            await update.message.reply_text("❌ RAG store tidak aktif.")
+            return
+        docs = await _rag_store.list_documents(user_id)
+        if not docs:
+            await update.message.reply_text("📚 Belum ada dokumen yang disimpan.")
+            return
+        lines = ["📚 <b>Dokumen Tersimpan:</b>\n"]
+        for d in docs:
+            lines.append(f"• <code>{ui.escape(d)}</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+    elif cmd == "delete" and len(args) > 1:
+        doc_name = " ".join(args[1:])
+        if _rag_store is None:
+            await update.message.reply_text("❌ RAG store tidak aktif.")
+            return
+        count = await _rag_store.delete_document(user_id, doc_name)
+        if count:
+            await update.message.reply_text(f"✅ Dihapus: <code>{ui.escape(doc_name)}</code> ({count} chunks)", parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(f"❌ Dokumen <code>{ui.escape(doc_name)}</code> tidak ditemukan.", parse_mode=ParseMode.HTML)
+
+
+# --- #37 /python -------------------------------------------------------------
+
+async def python_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Execute Python code in a sandbox."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    # Check tier (premium/admin only to prevent abuse)
+    tier = getattr(prefs, "tier", "free")
+    if tier not in ("premium", "admin"):
+        await update.message.reply_text("💎 Fitur Code Sandbox hanya untuk pengguna Premium.")
+        return
+
+    args = context.args or []
+    code = update.message.text.split(maxsplit=1)[1] if len(args) else ""
+    if not code.strip():
+        await update.message.reply_text(
+            "🐍 <b>Python Sandbox</b>\n"
+            "Format: <code>/python print('hello')</code>\n\n"
+            "💡 <i>Bisa multiline jika mengirim via newline. Kode dibatasi 10 detik, memori maks 64MB (Linux), dan no-network.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Strip markdown code blocks if present
+    code = code.strip()
+    if code.startswith("```"):
+        code = code.split("\n", 1)[-1]
+        if code.endswith("```"):
+            code = code[:-3]
+    
+    placeholder = await update.message.reply_text("⚙️ Menjalankan kode...")
+    result = await execute_code(code)
+    out_text = format_sandbox_result(result)
+    
+    try:
+        await placeholder.edit_text(out_text, parse_mode=ParseMode.HTML)
+    except Exception:
+        await placeholder.edit_text(result.output[:4000] if result.output else "Error formatting result.")
+
+
+# --- #47 /premium (Telegram Stars) -------------------------------------------
+
+async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show premium upgrade options using Telegram Stars."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    tier = getattr(prefs, "tier", "free")
+    if tier == "admin":
+        await update.message.reply_text("👑 Kamu adalah Admin (mendapatkan semua fitur premium otomatis).")
+        return
+
+    text = (
+        "💎 <b>Tans AI Premium</b>\n\n"
+        "Upgrade ke Premium untuk membuka semua fitur canggih:\n"
+        "• 🤖 <b>Akses model terbaik</b> (tanpa batas fallback)\n"
+        "• 📚 <b>RAG Document Memory</b> (ingatan dari file PDF/TXT/DOCX)\n"
+        "• 🐍 <b>Python Sandbox</b> (eksekusi kode /python)\n"
+        "• 💬 <b>Tanpa limit pesan harian</b>\n\n"
+        f"<i>Status kamu saat ini: <b>{tier.upper()}</b></i>\n\n"
+        "Pilih paket langganan menggunakan <b>Telegram Stars (XTR)</b>:"
+    )
+
+    kb = payment.premium_keyboard()
+    if kb:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(text + "\n\n(Menu pembayaran tidak tersedia saat ini)", parse_mode=ParseMode.HTML)
+
+
+async def buy_premium_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the 'buy' callback buttons for Telegram Stars."""
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    payload = query.data.replace("buy_", "")  # premium_monthly | premium_once
+    
+    # Send invoice
+    await payment.send_premium_invoice(update, context, payload)

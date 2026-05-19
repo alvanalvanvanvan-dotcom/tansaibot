@@ -18,3 +18,18 @@ apscheduler>=3.10.4
 
 # Webhook mode needs no extra deps (handled by python-telegram-bot)
 # Web search uses httpx (already installed)
+
+# Tier L features (#17, #22, #32, #47)
+# Admin Dashboard (#17)
+fastapi>=0.100.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+
+# PostgreSQL backend (#22) - optional
+# asyncpg>=0.29.0
+
+# RAG & Document processing (#32) - optional
+# chromadb>=0.4.0
+# sentence-transformers>=2.2.2
+# pypdf>=4.0.0
+# python-docx>=1.1.0
