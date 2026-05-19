@@ -108,7 +108,7 @@ LAST_AI_MESSAGE = "last_ai_message_id"
 # --- Config -----------------------------------------------------------------
 
 def _config() -> dict[str, str | int | float]:
-    load_dotenv()
+    load_dotenv(override=True)
     required = ["TELEGRAM_BOT_TOKEN", "TANS_AI_API_KEY"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
