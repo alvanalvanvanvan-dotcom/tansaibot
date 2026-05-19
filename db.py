@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     display_name         TEXT NOT NULL DEFAULT '',
     tts_enabled          INTEGER NOT NULL DEFAULT 0,
     privacy_mode         TEXT NOT NULL DEFAULT 'normal',
+    long_term_memory     TEXT NOT NULL DEFAULT '[]',
+    tier                 TEXT NOT NULL DEFAULT 'free',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -92,6 +94,17 @@ CREATE TABLE IF NOT EXISTS message_feedback (
     ts          TEXT    NOT NULL
 );
 
+-- (#40) Scheduled reminders
+CREATE TABLE IF NOT EXISTS reminders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    text        TEXT    NOT NULL,
+    remind_at   TEXT    NOT NULL,
+    sent        INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user
     ON sessions(user_id, pinned DESC, updated_at DESC);
 
@@ -106,6 +119,9 @@ CREATE INDEX IF NOT EXISTS idx_saved_prompts_user
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_ts
     ON audit_log(ts DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reminders_user
+    ON reminders(user_id, remind_at);
 """
 
 
@@ -138,6 +154,14 @@ _USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
     (
         "privacy_mode",
         "ALTER TABLE user_preferences ADD COLUMN privacy_mode TEXT NOT NULL DEFAULT 'normal'",
+    ),
+    (
+        "long_term_memory",
+        "ALTER TABLE user_preferences ADD COLUMN long_term_memory TEXT NOT NULL DEFAULT '[]'",
+    ),
+    (
+        "tier",
+        "ALTER TABLE user_preferences ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'",
     ),
 ]
 
@@ -182,8 +206,10 @@ class UserPrefs:
     display_name: str
     tts_enabled: bool
     privacy_mode: str
-    created_at: str
-    updated_at: str
+    long_term_memory: str = "[]"  # JSON list of strings (#35)
+    tier: str = "free"            # free | premium | admin (#45)
+    created_at: str = ""
+    updated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -643,6 +669,8 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         display_name=row["display_name"] if "display_name" in keys else "",
         tts_enabled=bool(row["tts_enabled"]) if "tts_enabled" in keys else False,
         privacy_mode=row["privacy_mode"] if "privacy_mode" in keys else "normal",
+        long_term_memory=row["long_term_memory"] if "long_term_memory" in keys else "[]",
+        tier=row["tier"] if "tier" in keys else "free",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -665,6 +693,8 @@ def _upsert_user_prefs_sync(
     display_name: str | None,
     tts_enabled: bool | None,
     privacy_mode: str | None = None,
+    long_term_memory: str | None = None,
+    tier: str | None = None,
 ) -> None:
     now = _now()
     with _connect(path) as conn:
@@ -675,8 +705,8 @@ def _upsert_user_prefs_sync(
             conn.execute(
                 "INSERT INTO user_preferences (user_id, default_model, persona, "
                 "custom_system_prompt, ui_language, onboarded, status, "
-                "display_name, tts_enabled, privacy_mode, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "display_name, tts_enabled, privacy_mode, long_term_memory, tier, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     default_model or "",
@@ -688,6 +718,8 @@ def _upsert_user_prefs_sync(
                     display_name or "",
                     1 if tts_enabled else 0,
                     privacy_mode or "normal",
+                    long_term_memory or "[]",
+                    tier or "free",
                     now,
                     now,
                 ),
@@ -722,6 +754,12 @@ def _upsert_user_prefs_sync(
         if privacy_mode is not None:
             fields.append("privacy_mode = ?")
             params.append(privacy_mode)
+        if long_term_memory is not None:
+            fields.append("long_term_memory = ?")
+            params.append(long_term_memory)
+        if tier is not None:
+            fields.append("tier = ?")
+            params.append(tier)
         if not fields:
             return
         fields.append("updated_at = ?")
@@ -746,6 +784,8 @@ async def upsert_user_prefs(
     display_name: str | None = None,
     tts_enabled: bool | None = None,
     privacy_mode: str | None = None,
+    long_term_memory: str | None = None,
+    tier: str | None = None,
 ) -> None:
     await asyncio.to_thread(
         _upsert_user_prefs_sync,
@@ -760,6 +800,8 @@ async def upsert_user_prefs(
         display_name=display_name,
         tts_enabled=tts_enabled,
         privacy_mode=privacy_mode,
+        long_term_memory=long_term_memory,
+        tier=tier,
     )
 
 
@@ -1025,3 +1067,131 @@ async def save_feedback(
     await asyncio.to_thread(
         _save_feedback_sync, Path(path), user_id, session_id, message_id, feedback
     )
+
+
+# --- Analytics / Insights (#18) -------------------------------------------
+
+def _user_analytics_sync(path: Path, user_id: int) -> dict:
+    """Return per-user analytics summary."""
+    with _connect(path) as conn:
+        sessions = conn.execute(
+            "SELECT COUNT(*) AS c FROM sessions WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        messages = conn.execute(
+            "SELECT COUNT(*) AS c FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id WHERE s.user_id = ?",
+            (user_id,),
+        ).fetchone()
+        tokens_row = conn.execute(
+            "SELECT COALESCE(SUM(tokens_in),0) AS ti, COALESCE(SUM(tokens_out),0) AS to2 "
+            "FROM usage_log WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        # Most-used models
+        model_rows = conn.execute(
+            "SELECT model, COUNT(*) AS c FROM usage_log WHERE user_id = ? "
+            "GROUP BY model ORDER BY c DESC LIMIT 5",
+            (user_id,),
+        ).fetchall()
+        # Activity by day (last 7 days)
+        day_rows = conn.execute(
+            "SELECT substr(ts,1,10) AS day, COUNT(*) AS c "
+            "FROM usage_log WHERE user_id = ? "
+            "GROUP BY day ORDER BY day DESC LIMIT 7",
+            (user_id,),
+        ).fetchall()
+
+    return {
+        "sessions": int(sessions["c"]) if sessions else 0,
+        "messages": int(messages["c"]) if messages else 0,
+        "tokens_in": int(tokens_row["ti"]) if tokens_row else 0,
+        "tokens_out": int(tokens_row["to2"]) if tokens_row else 0,
+        "top_models": [(r["model"], int(r["c"])) for r in model_rows],
+        "daily_activity": [(r["day"], int(r["c"])) for r in day_rows],
+    }
+
+
+async def user_analytics(path: str | Path, user_id: int) -> dict:
+    return await asyncio.to_thread(_user_analytics_sync, Path(path), user_id)
+
+
+# --- get_all_messages (for share.py #6) ------------------------------------
+
+def _get_all_messages_sync(path: Path, session_id: int) -> list[Message]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+    return [Message(role=r["role"], content=r["content"], id=r["id"]) for r in rows]
+
+
+async def get_all_messages(path: str | Path, session_id: int) -> list[Message]:
+    """Return all messages in a session ordered by id (for HTML export)."""
+    return await asyncio.to_thread(_get_all_messages_sync, Path(path), session_id)
+
+
+# --- Reminders (#40) -------------------------------------------------------
+
+from dataclasses import dataclass as _dc  # noqa: E402
+
+
+@_dc(frozen=True)
+class Reminder:
+    id: int
+    user_id: int
+    chat_id: int
+    text: str
+    remind_at: str
+    sent: bool
+    created_at: str
+
+
+def _save_reminder_sync(
+    path: Path, user_id: int, chat_id: int, text: str, remind_at: str
+) -> int:
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "INSERT INTO reminders (user_id, chat_id, text, remind_at, sent, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
+            (user_id, chat_id, text, remind_at, _now()),
+        )
+        return int(cur.lastrowid or 0)
+
+
+async def save_reminder(
+    path: str | Path, user_id: int, chat_id: int, text: str, remind_at: str
+) -> int:
+    return await asyncio.to_thread(
+        _save_reminder_sync, Path(path), user_id, chat_id, text, remind_at
+    )
+
+
+def _get_pending_reminders_sync(path: Path, before: str) -> list[Reminder]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, chat_id, text, remind_at, sent, created_at "
+            "FROM reminders WHERE sent = 0 AND remind_at <= ? ORDER BY remind_at ASC",
+            (before,),
+        ).fetchall()
+    return [
+        Reminder(
+            id=r["id"], user_id=r["user_id"], chat_id=r["chat_id"],
+            text=r["text"], remind_at=r["remind_at"],
+            sent=bool(r["sent"]), created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+
+
+async def get_pending_reminders(path: str | Path, before: str) -> list[Reminder]:
+    return await asyncio.to_thread(_get_pending_reminders_sync, Path(path), before)
+
+
+def _mark_reminder_sent_sync(path: Path, reminder_id: int) -> None:
+    with _connect(path) as conn:
+        conn.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+
+
+async def mark_reminder_sent(path: str | Path, reminder_id: int) -> None:
+    await asyncio.to_thread(_mark_reminder_sent_sync, Path(path), reminder_id)

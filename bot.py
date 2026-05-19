@@ -70,6 +70,15 @@ try:
 except ImportError:
     _SENTRY_AVAILABLE = False
 
+# Tier M imports
+import memory
+import group as group_mod
+from cost_tracker import cost_usd, format_cost, get_fallback_model, get_user_tier, is_model_allowed
+from scheduler import ReminderScheduler, parse_reminder_time
+from web_search import format_results_for_prompt, search as web_search_fn, summarize_url
+from share import generate_session_html
+from webhook import get_webhook_config, is_webhook_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -2450,6 +2459,24 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("rotatekey", rotatekey_command))     # (#26)
     application.add_handler(CommandHandler("backup", backup_command))           # (#24)
     application.add_handler(CommandHandler("auditlog", auditlog_command))       # (#28)
+    # v2 Tier-M handlers
+    application.add_handler(CommandHandler("insights", insights_command))       # (#18)
+    application.add_handler(CommandHandler("remember", remember_command))       # (#35)
+    application.add_handler(CommandHandler("memories", memories_command))       # (#35)
+    application.add_handler(CommandHandler("forget", forget_memory_command))    # (#35)
+    application.add_handler(CommandHandler("search_web", web_search_command))   # (#38)
+    application.add_handler(CommandHandler("websearch", web_search_command))    # (#38)
+    application.add_handler(CommandHandler("summarize", summarize_url_command)) # (#34)
+    application.add_handler(CommandHandler("remind", remind_command))           # (#40)
+    application.add_handler(CommandHandler("share", share_command))             # (#6)
+    application.add_handler(CommandHandler("cost", cost_command))               # (#44)
+    application.add_handler(CommandHandler("settier", set_tier_command))        # (#45)
+    application.add_handler(
+        MessageHandler(filters.PHOTO, photo_message)                             # (#31)
+    )
+    application.add_handler(
+        MessageHandler(filters.Document.ALL & ~filters.PHOTO, document_message) # (#31)
+    )
 
     application.add_handler(
         CallbackQueryHandler(model_callback, pattern=f"^{ui.MODEL_PREFIX}")
@@ -2549,12 +2576,35 @@ def main() -> None:
         port=int(cfg.get("health_port", 8081)),
     )
 
+    # (#40) Reminder scheduler
+    reminder_scheduler = ReminderScheduler(application.bot)
+    application.bot_data["reminder_scheduler"] = reminder_scheduler
+
     async def _run() -> None:
         await health_server.start()
-        logger.info("Bot starting (long polling)...")
+        await reminder_scheduler.start()
+        logger.info("Bot starting...")
+
+        # (#21) Webhook or long polling
+        webhook_cfg = get_webhook_config()
         async with application:
             await application.start()
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+            if webhook_cfg:
+                logger.info("Webhook mode: %s", webhook_cfg["url"])
+                await application.updater.start_webhook(
+                    listen=webhook_cfg["listen"],
+                    port=webhook_cfg["port"],
+                    url_path=webhook_cfg["path"],
+                    webhook_url=webhook_cfg["url"],
+                    secret_token=webhook_cfg.get("secret_token") or None,
+                    cert=webhook_cfg.get("cert"),
+                    key=webhook_cfg.get("key"),
+                    allowed_updates=Update.ALL_TYPES,
+                )
+            else:
+                logger.info("Long polling mode")
+                await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
             # (#16) Graceful shutdown on SIGTERM / SIGINT
             stop_event = asyncio.Event()
@@ -2568,15 +2618,15 @@ def main() -> None:
                 try:
                     loop.add_signal_handler(sig, _handle_signal)
                 except (NotImplementedError, RuntimeError):
-                    # Windows does not support add_signal_handler for all signals
                     pass
 
             await stop_event.wait()
 
-            logger.info("Stopping updater...")
+            logger.info("Stopping...")
             await application.updater.stop()
             await application.stop()
         await health_server.stop()
+        await reminder_scheduler.stop()
         await tans_client.aclose()
         logger.info("Bot stopped cleanly.")
 
@@ -2873,3 +2923,595 @@ async def auditlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"  <i>{ui.escape(e.detail[:100])}</i>"
         )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ============================================================================
+# v2 Tier-M Command Handlers
+# ============================================================================
+
+# --- #18 /insights -----------------------------------------------------------
+
+async def insights_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show personal usage analytics."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+
+    data = await db.user_analytics(db_path, user_id)
+    tokens_total = data["tokens_in"] + data["tokens_out"]
+    default_model = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    # Estimate cost
+    cost = 0.0
+    for model_name, _ in data["top_models"]:
+        # rough split 50/50 in/out
+        cost += cost_usd(model_name, data["tokens_in"] // 2, data["tokens_out"] // 2)
+
+    # Activity bar chart
+    activity_lines = []
+    if data["daily_activity"]:
+        max_c = max(c for _, c in data["daily_activity"]) or 1
+        for day, count in reversed(data["daily_activity"]):
+            bar = "█" * max(1, int(count / max_c * 10))
+            activity_lines.append(f"  {day}: {bar} ({count})")
+
+    model_lines = "\n".join(
+        f"  {i+1}. <code>{ui.escape(m)}</code> — {c} requests"
+        for i, (m, c) in enumerate(data["top_models"])
+    ) or "  (tidak ada data)"
+
+    tier = getattr(prefs, "tier", "free")
+    text = (
+        f"📊 <b>Insight Penggunaan</b> — {ui.escape(prefs.display_name or str(user_id))}\n"
+        f"Tier: <code>{tier}</code>\n\n"
+        f"💬 Sesi: <b>{data['sessions']}</b> &nbsp;·&nbsp; "
+        f"Pesan: <b>{data['messages']}</b>\n"
+        f"🔢 Token: <b>{tokens_total:,}</b> "
+        f"(in: {data['tokens_in']:,} / out: {data['tokens_out']:,})\n"
+        f"💰 Estimasi biaya: <b>{format_cost(cost)}</b>\n\n"
+        f"🤖 <b>Top Model:</b>\n{model_lines}\n"
+    )
+    if activity_lines:
+        text += "\n📅 <b>Aktivitas 7 hari terakhir:</b>\n" + "\n".join(activity_lines)
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# --- #35 /remember /memories /forget -----------------------------------------
+
+async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Store a long-term memory fact: /remember <fact>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🧠 <b>Ingat Fakta</b>\n"
+            "Format: <code>/remember fakta tentang kamu</code>\n\n"
+            "Contoh:\n"
+            "<code>/remember Saya seorang developer Python dari Jakarta</code>\n\n"
+            "AI akan mengingat ini di semua percakapan. Lihat: /memories",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    fact = " ".join(args)
+    raw = getattr(prefs, "long_term_memory", "[]")
+    new_raw, is_dup = memory.add_memory(raw, fact)
+
+    if is_dup:
+        await update.message.reply_text(
+            f"ℹ️ Fakta ini sudah tersimpan sebelumnya.",
+        )
+        return
+
+    await db.upsert_user_prefs(db_path, user_id, long_term_memory=new_raw)
+    count = len(memory.list_memories(new_raw))
+    await update.message.reply_text(
+        f"🧠 Fakta disimpan! Total ingatan: <b>{count}</b>\n"
+        f"<i>{ui.escape(fact[:200])}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all long-term memories."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    raw = getattr(prefs, "long_term_memory", "[]")
+    items = memory.list_memories(raw)
+    if not items:
+        await update.message.reply_text(
+            "🧠 Belum ada ingatan. Simpan dengan /remember"
+        )
+        return
+
+    lines = ["🧠 <b>Ingatanmu:</b>\n"]
+    for i, item in enumerate(items, 1):
+        lines.append(f"{i}. {ui.escape(item)}")
+    lines.append("\n<i>Hapus dengan /forget &lt;nomor&gt;</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def forget_memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete a memory by index: /forget <number>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "Format: <code>/forget &lt;nomor&gt;</code> (lihat /memories)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    idx = int(args[0])
+    raw = getattr(prefs, "long_term_memory", "[]")
+    new_raw, ok = memory.remove_memory(raw, idx)
+    if not ok:
+        await update.message.reply_text(f"❌ Nomor {idx} tidak valid.")
+        return
+    await db.upsert_user_prefs(db_path, user_id, long_term_memory=new_raw)
+    await update.message.reply_text(f"✅ Ingatan #{idx} dihapus.")
+
+
+# --- #38 /websearch ----------------------------------------------------------
+
+async def web_search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search the web and let AI summarize: /websearch <query>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🌐 Format: <code>/websearch pertanyaan kamu</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    query = " ".join(args)
+    placeholder = await update.message.reply_text(f"🔍 Mencari: <i>{ui.escape(query)}</i>...", parse_mode=ParseMode.HTML)
+
+    results = await web_search_fn(query, max_results=3)
+    context_block = format_results_for_prompt(results, query)
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
+
+    prompt = f"{context_block}\n\nBerdasarkan hasil pencarian di atas, jawab: {query}"
+
+    client: TansAIClient = context.application.bot_data["tans_client"]
+    try:
+        reply = await client.chat(message=prompt, model=model)
+    except TansAIError as exc:
+        await placeholder.edit_text(f"❌ {exc}")
+        return
+
+    from markdown_utils import to_telegram_html
+    try:
+        await placeholder.edit_text(
+            f"🌐 <b>Web Search:</b> {ui.escape(query)}\n\n{to_telegram_html(reply)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await placeholder.edit_text(reply)
+
+    # Show source URLs
+    if results:
+        url_lines = "\n".join(
+            f"• <a href=\"{r['url']}\">{ui.escape(r['title'][:60])}</a>"
+            for r in results if r.get("url")
+        )
+        if url_lines:
+            try:
+                await update.message.reply_text(
+                    f"📎 <b>Sumber:</b>\n{url_lines}",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+
+# --- #34 /summarize <url> ----------------------------------------------------
+
+async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Summarize a URL: /summarize https://..."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "🔗 Format: <code>/summarize https://url-artikel.com</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    url = args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    placeholder = await update.message.reply_text(f"⏳ Mengambil konten dari URL...")
+
+    page_text = await summarize_url(url)
+    if page_text.startswith("Gagal"):
+        await placeholder.edit_text(f"❌ {page_text}")
+        return
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    model = _active_model(prefs, default_model)
+    client: TansAIClient = context.application.bot_data["tans_client"]
+
+    lang = prefs.ui_language
+    prompt = (
+        f"Ringkas artikel berikut dalam {'bahasa Indonesia' if lang == 'id' else 'English'}, "
+        f"poin-poin utama, maksimal 5 paragraf:\n\n{page_text}"
+    )
+
+    try:
+        reply = await client.chat(message=prompt, model=model)
+    except TansAIError as exc:
+        await placeholder.edit_text(f"❌ {exc}")
+        return
+
+    from markdown_utils import to_telegram_html
+    try:
+        await placeholder.edit_text(
+            f"🔗 <b>Ringkasan:</b> <a href=\"{url}\">{url[:60]}</a>\n\n{to_telegram_html(reply)}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        await placeholder.edit_text(f"Ringkasan {url}:\n\n{reply}")
+
+
+# --- #40 /remind -------------------------------------------------------------
+
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set a reminder: /remind 30 menit lagi beli kopi"""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⏰ <b>Pengingat</b>\n"
+            "Format: <code>/remind &lt;waktu&gt; &lt;pesan&gt;</code>\n\n"
+            "Contoh:\n"
+            "<code>/remind 30 menit lagi meeting</code>\n"
+            "<code>/remind besok 09:00 backup server</code>\n"
+            "<code>/remind 2 jam lagi minum obat</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else user_id
+    db_path: str = context.application.bot_data["db_path"]
+
+    # Try to parse time from first 1-3 words
+    time_text = " ".join(args[:3])
+    remind_dt = parse_reminder_time(time_text)
+
+    if remind_dt is None:
+        # Fallback: try first 2 words
+        time_text = " ".join(args[:2])
+        remind_dt = parse_reminder_time(time_text)
+
+    if remind_dt is None:
+        await update.message.reply_text(
+            "❌ Tidak bisa membaca waktu. Coba format:\n"
+            "<code>/remind 30 menit lagi pesan kamu</code>\n"
+            "<code>/remind 2 jam lagi pesan kamu</code>\n"
+            "<code>/remind besok 09:00 pesan kamu</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    reminder_text = " ".join(args[2:]) or " ".join(args[1:])
+
+    # Save to DB
+    from datetime import timezone
+    remind_at_str = remind_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    await db.save_reminder(db_path, user_id, chat_id, reminder_text, remind_at_str)
+
+    # Try APScheduler
+    scheduler: ReminderScheduler | None = context.application.bot_data.get("reminder_scheduler")
+    scheduled = False
+    if scheduler:
+        scheduled = await scheduler.add_reminder(user_id, chat_id, reminder_text, remind_dt)
+
+    local_time = remind_dt.strftime("%d %b %Y %H:%M UTC")
+    await update.message.reply_text(
+        f"✅ Pengingat diset!\n"
+        f"⏰ Waktu: <b>{local_time}</b>\n"
+        f"📝 Pesan: <i>{ui.escape(reminder_text[:200])}</i>"
+        + ("\n\n⚠️ <i>APScheduler tidak tersedia — instal: pip install apscheduler</i>" if not scheduled else ""),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --- #6 /share ---------------------------------------------------------------
+
+async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Share current session as HTML: /share"""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+
+    sid = context.user_data.get("active_session_id") if context.user_data else None
+    args = context.args or []
+    if args and args[0].isdigit():
+        sid = int(args[0])
+
+    if not isinstance(sid, int):
+        await update.message.reply_text(
+            "❌ Tidak ada sesi aktif. Mulai chat dulu atau gunakan /history.",
+        )
+        return
+
+    session = await db.get_session(db_path, sid)
+    if session is None or session.user_id != user_id:
+        await update.message.reply_text("❌ Sesi tidak ditemukan.")
+        return
+
+    html_bytes = await generate_session_html(db_path, sid)
+    if html_bytes is None:
+        await update.message.reply_text("❌ Gagal membuat halaman share.")
+        return
+
+    title = session.title or f"session_{sid}"
+    safe_title = "".join(c if c.isalnum() or c in " -_" else "_" for c in title)[:40]
+    filename = f"{safe_title}.html"
+
+    import io
+    await update.message.reply_document(
+        document=io.BytesIO(html_bytes),
+        filename=filename,
+        caption=f"🌐 <b>{ui.escape(title)}</b>\n<i>{session.message_count} pesan — {session.model}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --- #44 /cost ---------------------------------------------------------------
+
+async def cost_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show estimated cost for this session or overall."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    data = await db.user_analytics(db_path, user_id)
+    total_cost = 0.0
+    for model_name, _ in data["top_models"]:
+        total_cost += cost_usd(model_name, data["tokens_in"] // 2, data["tokens_out"] // 2)
+
+    tier = getattr(prefs, "tier", "free")
+    await update.message.reply_text(
+        f"💰 <b>Estimasi Biaya</b>\n"
+        f"Tier: <code>{tier}</code>\n\n"
+        f"Token masuk: <b>{data['tokens_in']:,}</b>\n"
+        f"Token keluar: <b>{data['tokens_out']:,}</b>\n"
+        f"Total token: <b>{data['tokens_in'] + data['tokens_out']:,}</b>\n\n"
+        f"💵 Estimasi: <b>{format_cost(total_cost)}</b>\n"
+        f"<i>(Estimasi kasar berdasarkan harga publik model)</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --- #45 /settier (admin) ----------------------------------------------------
+
+async def set_tier_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: set user tier. /settier <user_id> <free|premium|admin>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("🚫 Hanya admin.")
+        return
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Format: <code>/settier &lt;user_id&gt; &lt;free|premium|admin&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ User ID tidak valid.")
+        return
+
+    tier = args[1].lower()
+    if tier not in ("free", "premium", "admin"):
+        await update.message.reply_text("❌ Tier tidak valid. Pilih: free, premium, admin")
+        return
+
+    db_path: str = context.application.bot_data["db_path"]
+    await db.upsert_user_prefs(db_path, target_id, tier=tier)
+    await db.log_audit(
+        db_path,
+        admin_id=update.effective_user.id,
+        action="settier",
+        target_id=target_id,
+        detail=f"tier set to {tier}",
+    )
+    await update.message.reply_text(
+        f"✅ User <code>{target_id}</code> tier diset ke <b>{tier}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --- #31 Photo / Document handler (OCR placeholder) --------------------------
+
+async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle photo messages — describe or OCR the image."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    caption = update.message.caption or ""
+    prompt_question = caption.strip() if caption.strip() else (
+        "Deskripsikan gambar ini dalam bahasa Indonesia secara detail."
+        if prefs.ui_language == "id" else
+        "Describe this image in detail."
+    )
+
+    placeholder = await update.message.reply_text("🖼️ Memproses gambar...")
+
+    # Try OCR if pytesseract is available
+    ocr_text = ""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io as _io
+
+        photo = update.message.photo[-1]  # largest photo
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+        img = Image.open(_io.BytesIO(bytes(file_bytes)))
+        ocr_text = pytesseract.image_to_string(img, lang="ind+eng").strip()
+    except Exception:
+        pass
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    user_id = update.effective_user.id
+    model = _active_model(prefs, default_model)
+    client: TansAIClient = context.application.bot_data["tans_client"]
+
+    if ocr_text:
+        prompt = f"Teks dari gambar (OCR):\n{ocr_text}\n\n{prompt_question}"
+    else:
+        prompt = (
+            f"[Pengguna mengirim gambar.]\n"
+            f"Caption/pertanyaan: {prompt_question}\n"
+            f"(OCR tidak tersedia — jawab berdasarkan pertanyaan pengguna.)"
+        )
+
+    try:
+        reply = await client.chat(message=prompt, model=model)
+    except TansAIError as exc:
+        await placeholder.edit_text(f"❌ {exc}")
+        return
+
+    from markdown_utils import to_telegram_html
+    try:
+        await placeholder.edit_text(
+            to_telegram_html(reply), parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        await placeholder.edit_text(reply)
+
+
+async def document_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle document/file uploads — extract text if possible."""
+    assert update.message is not None
+    assert update.effective_user is not None
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None or deny:
+        if deny:
+            await update.message.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    doc = update.message.document
+    if doc is None:
+        return
+
+    caption = (update.message.caption or "").strip()
+    placeholder = await update.message.reply_text(f"📄 Memproses dokumen: {ui.escape(doc.file_name or 'file')}...")
+
+    # Only process text-like files
+    text_mimes = {"text/plain", "text/csv", "application/json", "text/markdown", "text/html"}
+    if doc.mime_type not in text_mimes:
+        await placeholder.edit_text(
+            f"⚠️ Tipe file <code>{ui.escape(doc.mime_type or 'unknown')}</code> belum didukung.\n"
+            "Format yang didukung: .txt, .csv, .json, .md, .html",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        content_bytes = await file.download_as_bytearray()
+        content = content_bytes.decode("utf-8", errors="replace")[:4000]
+    except Exception as exc:
+        await placeholder.edit_text(f"❌ Gagal membaca file: {exc}")
+        return
+
+    question = caption or (
+        "Analisis dan rangkum isi dokumen ini."
+        if prefs.ui_language == "id" else
+        "Analyze and summarize this document."
+    )
+
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    model = _active_model(prefs, default_model)
+    client: TansAIClient = context.application.bot_data["tans_client"]
+
+    prompt = f"Dokumen: {doc.file_name}\n\nIsi:\n{content}\n\nPertanyaan: {question}"
+
+    try:
+        reply = await client.chat(message=prompt, model=model)
+    except TansAIError as exc:
+        await placeholder.edit_text(f"❌ {exc}")
+        return
+
+    from markdown_utils import to_telegram_html
+    try:
+        await placeholder.edit_text(
+            f"📄 <b>{ui.escape(doc.file_name or 'Dokumen')}</b>\n\n{to_telegram_html(reply)}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        await placeholder.edit_text(reply)

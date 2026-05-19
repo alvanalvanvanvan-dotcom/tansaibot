@@ -9,15 +9,12 @@ structlog>=24.1.0
 # Error tracking (#14)
 sentry-sdk>=2.0.0
 
-# Scheduling / reminders (#40) - optional, installed if needed
-# APScheduler>=3.10.4
+# Scheduling / reminders (#40)
+apscheduler>=3.10.4
 
-# OCR (#31) - optional
+# OCR (#31) - optional, requires tesseract binary installed separately
 # pytesseract>=0.3.10
 # Pillow>=10.3.0
 
-# Web search (#38) - optional
-# httpx is already installed
-
-# Voice / Whisper (#voice) - optional
-# openai>=1.30.0
+# Webhook mode needs no extra deps (handled by python-telegram-bot)
+# Web search uses httpx (already installed)
