@@ -62,6 +62,11 @@ ADMIN_USER = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASSWORD", "tansaibot2024")
 DB_PATH = os.getenv("CHAT_DB_PATH", str(Path(__file__).resolve().parent.parent / "chat_history.db"))
 
+if _FASTAPI_AVAILABLE:
+    @app.on_event("startup")
+    async def startup_event():
+        await db.init_db(DB_PATH)
+
 # ---------------------------------------------------------------------------
 # Auth helpers (simple HMAC token — no external deps)
 # ---------------------------------------------------------------------------
