@@ -2378,26 +2378,6 @@ async def _post_init(application: Application) -> None:
         )
     if cfg.get("waitlist_mode"):
         logger.info("WAITLIST_MODE on \u2014 new users default to 'waitlist' status.")
-    voice_cfg = voice_mod.VoiceConfig(
-        api_base=str(cfg.get("voice_api_base", "")),
-        api_key=str(cfg.get("voice_api_key", "")),
-        stt_model=str(cfg.get("voice_stt_model", "whisper-1")),
-        tts_model=str(cfg.get("voice_tts_model", "tts-1")),
-        tts_voice=str(cfg.get("voice_tts_voice", "alloy")),
-        timeout=float(cfg.get("voice_timeout", 60.0)),
-    )
-    vc = voice_mod.VoiceClient(voice_cfg)
-    application.bot_data["voice_client"] = vc
-    if vc.enabled:
-        logger.info(
-            "Voice enabled (base=%s, stt=%s, tts=%s/%s)",
-            voice_cfg.api_base,
-            voice_cfg.stt_model,
-            voice_cfg.tts_model,
-            voice_cfg.tts_voice,
-        )
-    else:
-        logger.info("Voice disabled (VOICE_API_KEY not set)")
     await _publish_bot_commands(application)
 
 
@@ -2445,7 +2425,6 @@ def build_application() -> Application:
             "bot_username": cfg["bot_username"],
         }
     )
-    
     # Initialize TansAIClient synchronously so it's available immediately in bot_data
     client = TansAIClient(
         base_url=str(cfg["tans_base_url"]),
@@ -2453,6 +2432,28 @@ def build_application() -> Application:
         timeout=float(cfg["timeout"]),
     )
     application.bot_data["tans_client"] = client
+
+    # Initialize VoiceClient synchronously
+    voice_cfg = voice_mod.VoiceConfig(
+        api_base=str(cfg.get("voice_api_base", "")),
+        api_key=str(cfg.get("voice_api_key", "")),
+        stt_model=str(cfg.get("voice_stt_model", "whisper-1")),
+        tts_model=str(cfg.get("voice_tts_model", "tts-1")),
+        tts_voice=str(cfg.get("voice_tts_voice", "alloy")),
+        timeout=float(cfg.get("voice_timeout", 60.0)),
+    )
+    vc = voice_mod.VoiceClient(voice_cfg)
+    application.bot_data["voice_client"] = vc
+    if vc.enabled:
+        logger.info(
+            "Voice enabled (base=%s, stt=%s, tts=%s/%s)",
+            voice_cfg.api_base,
+            voice_cfg.stt_model,
+            voice_cfg.tts_model,
+            voice_cfg.tts_voice,
+        )
+    else:
+        logger.info("Voice disabled (VOICE_API_KEY not set)")
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
