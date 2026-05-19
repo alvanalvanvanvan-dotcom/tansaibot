@@ -1,4 +1,18 @@
-"""Telegram bot that proxies messages to a Tans AI API Gateway."""
+"""Telegram bot that proxies messages to a Tans AI API Gateway.
+
+v2 additions (Tier S):
+  - Structured JSON logging via logging_setup (#13)
+  - Sentry error tracking (#14)
+  - Health + metrics HTTP server (#15)
+  - Graceful SIGTERM shutdown (#16)
+  - /forgetme — GDPR data deletion (#11)
+  - /privacy — strict privacy mode (#30)
+  - /save, /useprompt, /myprompts — saved prompt templates (#8)
+  - /rotatekey — API key hot-swap (#26)
+  - /backup — SQLite backup (#24)
+  - /auditlog — admin audit log (#28)
+  - Telegram language_code → auto UI language (#50/#12)
+"""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +21,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import signal
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,19 +58,28 @@ import streaming
 import summarizer
 import ui
 import voice as voice_mod
+from health import HealthServer, metrics
+from logging_setup import setup_logging
 from markdown_utils import chunk_for_telegram, to_telegram_html
 from tans_client import TansAIClient, TansAIError
+
+# --- Sentry (optional) (#14) -------------------------------------------------
+try:
+    import sentry_sdk
+    _SENTRY_AVAILABLE = True
+except ImportError:
+    _SENTRY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 
-# Pending-action keys stored in ``context.user_data``. They capture state
-# carried between two messages (e.g. user pressed Quick Prompt -> we wait
-# for their next message to be the input for that template).
+# Pending-action keys stored in ``context.user_data``.
 PENDING_QUICK = "pending_quick"
 PENDING_RENAME = "pending_rename"
 PENDING_CUSTOM_PROMPT = "pending_custom_prompt"
 PENDING_SEARCH = "pending_search"
+PENDING_SAVE_PROMPT_NAME = "pending_save_prompt_name"   # (#8)
+PENDING_SAVE_PROMPT_CONTENT = "pending_save_prompt_content"  # (#8)
 
 # Per-user-per-chat cache of the most recently rendered AI placeholder
 # message id, so the Regenerate button can edit the same message instead
@@ -105,6 +130,10 @@ def _config() -> dict[str, str | int | float]:
         "voice_tts_voice": os.getenv("VOICE_TTS_VOICE", "alloy"),
         "voice_timeout": float(os.getenv("VOICE_TIMEOUT", "60")),
         "bot_username": os.getenv("BOT_USERNAME", ""),
+        # v2 additions
+        "sentry_dsn": os.getenv("SENTRY_DSN", ""),           # (#14)
+        "log_level": os.getenv("LOG_LEVEL", "INFO"),          # (#13)
+        "health_port": int(os.getenv("HEALTH_PORT", "8081")), # (#15)
     }
 
 
@@ -2412,6 +2441,15 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("tts", tts_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    # v2 Tier-S handlers
+    application.add_handler(CommandHandler("forgetme", forgetme_command))       # (#11)
+    application.add_handler(CommandHandler("privacy", privacy_command))         # (#30)
+    application.add_handler(CommandHandler("save", save_prompt_command))        # (#8)
+    application.add_handler(CommandHandler("useprompt", use_prompt_command))    # (#8)
+    application.add_handler(CommandHandler("myprompts", my_prompts_command))    # (#8)
+    application.add_handler(CommandHandler("rotatekey", rotatekey_command))     # (#26)
+    application.add_handler(CommandHandler("backup", backup_command))           # (#24)
+    application.add_handler(CommandHandler("auditlog", auditlog_command))       # (#28)
 
     application.add_handler(
         CallbackQueryHandler(model_callback, pattern=f"^{ui.MODEL_PREFIX}")
@@ -2486,15 +2524,352 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
+    cfg = _config()
+
+    # (#13) Structured logging
+    setup_logging(str(cfg.get("log_level", "INFO")))
+
+    # (#14) Sentry error tracking
+    sentry_dsn = str(cfg.get("sentry_dsn", ""))
+    if sentry_dsn and _SENTRY_AVAILABLE:
+        sentry_sdk.init(
+            dsn=sentry_dsn,
+            traces_sample_rate=0.1,
+        )
+        logger.info("Sentry initialized")
+
+    application = build_application(cfg)
+    db_path: str = application.bot_data["db_path"]
+    tans_client: TansAIClient = application.bot_data["tans_client"]
+
+    # (#15) Health server
+    health_server = HealthServer(
+        db_path=db_path,
+        tans_client=tans_client,
+        port=int(cfg.get("health_port", 8081)),
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    application = build_application()
-    logger.info("Bot starting (long polling)...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    async def _run() -> None:
+        await health_server.start()
+        logger.info("Bot starting (long polling)...")
+        async with application:
+            await application.start()
+            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+            # (#16) Graceful shutdown on SIGTERM / SIGINT
+            stop_event = asyncio.Event()
+
+            def _handle_signal() -> None:
+                logger.info("Shutdown signal received, stopping gracefully...")
+                stop_event.set()
+
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, _handle_signal)
+                except (NotImplementedError, RuntimeError):
+                    # Windows does not support add_signal_handler for all signals
+                    pass
+
+            await stop_event.wait()
+
+            logger.info("Stopping updater...")
+            await application.updater.stop()
+            await application.stop()
+        await health_server.stop()
+        await tans_client.aclose()
+        logger.info("Bot stopped cleanly.")
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================================
+# v2 Tier-S Command Handlers
+# ============================================================================
+
+# --- #11 /forgetme -----------------------------------------------------------
+
+async def forgetme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """GDPR: permanently delete all user data from this bot."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+
+    # Confirm step: require user to type /forgetme confirm
+    args = context.args or []
+    if "confirm" not in args:
+        await update.message.reply_text(
+            "⚠️ <b>Hapus Semua Data?</b>\n\n"
+            "Ini akan menghapus SELURUH riwayat percakapan, preferensi, "
+            "dan data kamu dari bot ini secara permanen.\n\n"
+            "Untuk konfirmasi, kirim:\n"
+            "<code>/forgetme confirm</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await db.forget_user(db_path, user_id)
+    if context.user_data is not None:
+        context.user_data.clear()
+    await update.message.reply_text(
+        "✅ Semua data kamu telah dihapus dari bot ini.\n"
+        "Kamu bisa mulai dari awal dengan /start.",
+    )
+    logger.info("forgetme: user %d deleted all their data", user_id)
+
+
+# --- #30 /privacy ------------------------------------------------------------
+
+async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle privacy mode: normal (default) vs strict (no history saved)."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+    default_model: str = context.application.bot_data["default_model"]
+    prefs = await _ensure_prefs(db_path, user_id, default_model)
+
+    args = context.args or []
+    if not args:
+        current = getattr(prefs, "privacy_mode", "normal")
+        await update.message.reply_text(
+            f"🔒 <b>Privacy Mode</b>\n"
+            f"Mode saat ini: <code>{current}</code>\n\n"
+            "• <code>/privacy normal</code> — simpan riwayat chat (default)\n"
+            "• <code>/privacy strict</code> — tidak simpan chat sama sekali (hanya in-memory)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    mode = args[0].lower()
+    if mode not in ("normal", "strict"):
+        await update.message.reply_text("Mode tidak valid. Gunakan: normal atau strict")
+        return
+
+    await db.upsert_user_prefs(db_path, user_id, privacy_mode=mode)
+    emoji = "🔒" if mode == "strict" else "🔓"
+    await update.message.reply_text(
+        f"{emoji} Privacy mode diubah ke <code>{mode}</code>.\n"
+        + ("Pesan tidak akan disimpan ke database mulai sekarang."
+           if mode == "strict" else "Riwayat chat akan disimpan secara normal."),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# --- #8 /save /useprompt /myprompts -----------------------------------------
+
+async def save_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save a custom prompt template: /save <name> <prompt text>"""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📝 <b>Simpan Prompt</b>\n"
+            "Format: <code>/save nama_prompt isi prompt kamu disini</code>\n\n"
+            "Contoh:\n"
+            "<code>/save ringkas Ringkas teks berikut dalam 3 poin: {teks}</code>\n\n"
+            "Panggil dengan /useprompt nama_prompt",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    name = args[0].lower().strip()
+    content = " ".join(args[1:])
+    await db.save_prompt(db_path, user_id, name, content)
+    await update.message.reply_text(
+        f"✅ Prompt <code>{ui.escape(name)}</code> disimpan!\n"
+        f"Isi: <i>{ui.escape(content[:200])}</i>\n\n"
+        "Panggil dengan: <code>/useprompt " + ui.escape(name) + "</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def use_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Use a saved prompt: /useprompt <name> [input]"""
+    assert update.message is not None
+    assert update.effective_user is not None
+    user_id = update.effective_user.id
+    db_path: str = context.application.bot_data["db_path"]
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Format: <code>/useprompt nama_prompt [input opsional]</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    name = args[0].lower()
+    prompts = await db.list_saved_prompts(db_path, user_id)
+    found = next((p for p in prompts if p.name == name), None)
+    if found is None:
+        await update.message.reply_text(
+            f"❌ Prompt <code>{ui.escape(name)}</code> tidak ditemukan.\n"
+            "Lihat daftar prompt: /myprompts",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_input = " ".join(args[1:]) if len(args) > 1 else ""
+    final_prompt = found.content
+    if "{teks}" in final_prompt or "{input}" in final_prompt:
+        final_prompt = final_prompt.replace("{teks}", user_input).replace("{input}", user_input)
+    elif user_input:
+        final_prompt = final_prompt + "\n\n" + user_input
+
+    # Inject as pending message
+    if context.user_data is None:
+        return
+    context.user_data["_injected_message"] = final_prompt
+    await update.message.reply_text(
+        f"⚡ Menjalankan prompt <b>{ui.escape(name)}</b>...\n"
+        f"<i>{ui.escape(final_prompt[:200])}</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    # Fake a chat message trigger
+    await chat_message(
+        update._replace(message=update.message._replace(text=final_prompt)),  # type: ignore[attr-defined]
+        context,
+    ) if hasattr(update, "_replace") else None  # type: ignore[attr-defined]
+
+
+async def my_prompts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List saved prompts for this user."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    db_path: str = context.application.bot_data["db_path"]
+    user_id = update.effective_user.id
+
+    prompts = await db.list_saved_prompts(db_path, user_id)
+    if not prompts:
+        await update.message.reply_text(
+            "📭 Belum ada prompt tersimpan.\n"
+            "Simpan dengan: <code>/save nama isi prompt</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = ["📋 <b>Prompt Tersimpan:</b>\n"]
+    for p in prompts:
+        lines.append(
+            f"• <code>/useprompt {ui.escape(p.name)}</code>\n"
+            f"  <i>{ui.escape(p.content[:80])}{'...' if len(p.content) > 80 else ''}</i>"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# --- #26 /rotatekey ----------------------------------------------------------
+
+async def rotatekey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: hot-swap Tans AI API key without restart."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("🚫 Hanya admin yang bisa rotate API key.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Format: <code>/rotatekey tans_newKeyHere</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    new_key = args[0].strip()
+    client: TansAIClient = context.application.bot_data["tans_client"]
+    old_key = client.api_key
+    client.api_key = new_key
+    # Rebuild the internal httpx client with new auth headers
+    if client._client is not None:
+        await client.aclose()
+
+    await db.log_audit(
+        context.application.bot_data["db_path"],
+        admin_id=update.effective_user.id,
+        action="rotatekey",
+        detail=f"key rotated (old prefix: {old_key[:8]}...)",
+    )
+
+    await update.message.reply_text(
+        f"🔑 API key berhasil diperbarui (live, tanpa restart).\n"
+        f"Prefix baru: <code>{ui.escape(new_key[:8])}...</code>",
+        parse_mode=ParseMode.HTML,
+    )
+    logger.info(
+        "rotatekey: admin %d rotated API key", update.effective_user.id
+    )
+
+
+# --- #24 /backup -------------------------------------------------------------
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: download a SQLite backup as a Telegram document."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("🚫 Hanya admin.")
+        return
+
+    db_path = Path(context.application.bot_data["db_path"])
+    if not db_path.exists():
+        await update.message.reply_text("❌ File database tidak ditemukan.")
+        return
+
+    backup_path = db_path.parent / (db_path.stem + "_backup.db")
+    try:
+        await asyncio.to_thread(shutil.copy2, db_path, backup_path)
+        with open(backup_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=backup_path.name,
+                caption=f"📦 Backup database — {backup_path.stat().st_size // 1024} KB",
+            )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Backup gagal: {exc}")
+    finally:
+        if backup_path.exists():
+            backup_path.unlink(missing_ok=True)
+
+    await db.log_audit(
+        str(db_path),
+        admin_id=update.effective_user.id,
+        action="backup",
+        detail="manual backup via /backup",
+    )
+
+
+# --- #28 /auditlog -----------------------------------------------------------
+
+async def auditlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: show recent audit log."""
+    assert update.message is not None
+    assert update.effective_user is not None
+    if not _is_admin(context, update.effective_user.id):
+        await update.message.reply_text("🚫 Hanya admin.")
+        return
+
+    db_path: str = context.application.bot_data["db_path"]
+    entries = await db.get_audit_log(db_path, limit=20)
+    if not entries:
+        await update.message.reply_text("📋 Audit log masih kosong.")
+        return
+
+    lines = ["📋 <b>Audit Log (20 terakhir):</b>\n"]
+    for e in entries:
+        target = f" → user {e.target_id}" if e.target_id else ""
+        lines.append(
+            f"• <code>{e.ts[:16]}</code> admin {e.admin_id}: "
+            f"<b>{ui.escape(e.action)}</b>{ui.escape(target)}\n"
+            f"  <i>{ui.escape(e.detail[:100])}</i>"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)

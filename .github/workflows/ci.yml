@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "feature/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt 2>/dev/null || true
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8 --quiet
+          flake8 . --count --max-line-length=120 --exclude=.git,__pycache__ --statistics || true
+
+      - name: Type check with mypy (soft)
+        run: |
+          pip install mypy --quiet
+          mypy . --ignore-missing-imports --no-error-summary || true
+
+      - name: Run smoke tests
+        env:
+          TELEGRAM_BOT_TOKEN: "dummy:token"
+          TANS_AI_API_KEY: "tans_testkey12345678901234567"
+          TANS_AI_BASE_URL: "http://localhost:9999/api/v1"
+        run: |
+          python -c "import db; print('db.py OK')"
+          python -c "import tans_client; print('tans_client.py OK')"
+          python -c "import rate_limiter; print('rate_limiter.py OK')"
+          python -c "import logging_setup; print('logging_setup.py OK')"
+          python -c "import health; print('health.py OK')"
+          python -c "import personas; print('personas.py OK')"
+          python -c "import quick_prompts; print('quick_prompts.py OK')"
+          python -c "import markdown_utils; print('markdown_utils.py OK')"
+
+      - name: Test DB init & saved prompts
+        run: |
+          python - <<'EOF'
+          import asyncio, tempfile, pathlib, db
+
+          async def main():
+              with tempfile.TemporaryDirectory() as d:
+                  p = pathlib.Path(d) / "test.db"
+                  await db.init_db(p)
+                  await db.save_prompt(p, 123, "hello", "Say hello to {name}")
+                  prompts = await db.list_saved_prompts(p, 123)
+                  assert len(prompts) == 1
+                  assert prompts[0].name == "hello"
+                  await db.forget_user(p, 123)
+                  prompts = await db.list_saved_prompts(p, 123)
+                  assert len(prompts) == 0
+                  print("DB tests passed!")
+
+          asyncio.run(main())
+          EOF

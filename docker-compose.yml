@@ -1,0 +1,43 @@
+# ============================================================
+# tansaibot — docker-compose.yml (#19)
+# ============================================================
+# Quick start:
+#   1. Copy .env.example to .env and fill in your tokens
+#   2. docker compose up -d
+#
+# The DB file is stored in ./data/chat_history.db (persisted).
+# ============================================================
+
+version: "3.9"
+
+services:
+  tansaibot:
+    build: .
+    image: tansaibot:latest
+    container_name: tansaibot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override DB path to use the persistent volume
+      CHAT_DB_PATH: /app/data/chat_history.db
+    volumes:
+      - bot_data:/app/data
+    # Expose health endpoint if bot runs /healthz server (#15)
+    ports:
+      - "8081:8081"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('localhost',8081),2)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  bot_data:
+    driver: local

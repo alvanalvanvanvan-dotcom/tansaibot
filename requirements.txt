@@ -1,3 +1,23 @@
+# Core bot
 python-telegram-bot[rate-limiter]==21.6
-httpx==0.27.2
+httpx[http2]==0.27.2
 python-dotenv==1.0.1
+
+# Structured logging (#13)
+structlog>=24.1.0
+
+# Error tracking (#14)
+sentry-sdk>=2.0.0
+
+# Scheduling / reminders (#40) - optional, installed if needed
+# APScheduler>=3.10.4
+
+# OCR (#31) - optional
+# pytesseract>=0.3.10
+# Pillow>=10.3.0
+
+# Web search (#38) - optional
+# httpx is already installed
+
+# Voice / Whisper (#voice) - optional
+# openai>=1.30.0

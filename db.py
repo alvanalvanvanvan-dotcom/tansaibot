@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     status               TEXT NOT NULL DEFAULT 'active',
     display_name         TEXT NOT NULL DEFAULT '',
     tts_enabled          INTEGER NOT NULL DEFAULT 0,
+    privacy_mode         TEXT NOT NULL DEFAULT 'normal',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -61,6 +62,36 @@ CREATE TABLE IF NOT EXISTS usage_log (
     tokens_out  INTEGER NOT NULL DEFAULT 0
 );
 
+-- (#8) Saved prompt templates per user
+CREATE TABLE IF NOT EXISTS saved_prompts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    name        TEXT    NOT NULL,
+    content     TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL,
+    UNIQUE (user_id, name)
+);
+
+-- (#28) Audit log for admin actions
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id    INTEGER NOT NULL,
+    action      TEXT    NOT NULL,
+    target_id   INTEGER,
+    detail      TEXT    NOT NULL DEFAULT '',
+    ts          TEXT    NOT NULL
+);
+
+-- (#7) User reaction feedback on AI messages
+CREATE TABLE IF NOT EXISTS message_feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    session_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    feedback    TEXT    NOT NULL,
+    ts          TEXT    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user
     ON sessions(user_id, pinned DESC, updated_at DESC);
 
@@ -69,6 +100,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_session
 
 CREATE INDEX IF NOT EXISTS idx_usage_user
     ON usage_log(user_id, ts);
+
+CREATE INDEX IF NOT EXISTS idx_saved_prompts_user
+    ON saved_prompts(user_id, name);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts
+    ON audit_log(ts DESC);
 """
 
 
@@ -97,6 +134,10 @@ _USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
     (
         "tts_enabled",
         "ALTER TABLE user_preferences ADD COLUMN tts_enabled INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "privacy_mode",
+        "ALTER TABLE user_preferences ADD COLUMN privacy_mode TEXT NOT NULL DEFAULT 'normal'",
     ),
 ]
 
@@ -140,8 +181,28 @@ class UserPrefs:
     status: str
     display_name: str
     tts_enabled: bool
+    privacy_mode: str
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class SavedPrompt:
+    id: int
+    user_id: int
+    name: str
+    content: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    id: int
+    admin_id: int
+    action: str
+    target_id: int | None
+    detail: str
+    ts: str
 
 
 @dataclass(frozen=True)
@@ -581,6 +642,7 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         status=row["status"] if "status" in keys else STATUS_ACTIVE,
         display_name=row["display_name"] if "display_name" in keys else "",
         tts_enabled=bool(row["tts_enabled"]) if "tts_enabled" in keys else False,
+        privacy_mode=row["privacy_mode"] if "privacy_mode" in keys else "normal",
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -602,6 +664,7 @@ def _upsert_user_prefs_sync(
     status: str | None,
     display_name: str | None,
     tts_enabled: bool | None,
+    privacy_mode: str | None = None,
 ) -> None:
     now = _now()
     with _connect(path) as conn:
@@ -612,8 +675,8 @@ def _upsert_user_prefs_sync(
             conn.execute(
                 "INSERT INTO user_preferences (user_id, default_model, persona, "
                 "custom_system_prompt, ui_language, onboarded, status, "
-                "display_name, tts_enabled, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "display_name, tts_enabled, privacy_mode, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     default_model or "",
@@ -624,6 +687,7 @@ def _upsert_user_prefs_sync(
                     status or STATUS_ACTIVE,
                     display_name or "",
                     1 if tts_enabled else 0,
+                    privacy_mode or "normal",
                     now,
                     now,
                 ),
@@ -655,6 +719,9 @@ def _upsert_user_prefs_sync(
         if tts_enabled is not None:
             fields.append("tts_enabled = ?")
             params.append(1 if tts_enabled else 0)
+        if privacy_mode is not None:
+            fields.append("privacy_mode = ?")
+            params.append(privacy_mode)
         if not fields:
             return
         fields.append("updated_at = ?")
@@ -678,6 +745,7 @@ async def upsert_user_prefs(
     status: str | None = None,
     display_name: str | None = None,
     tts_enabled: bool | None = None,
+    privacy_mode: str | None = None,
 ) -> None:
     await asyncio.to_thread(
         _upsert_user_prefs_sync,
@@ -691,6 +759,7 @@ async def upsert_user_prefs(
         status=status,
         display_name=display_name,
         tts_enabled=tts_enabled,
+        privacy_mode=privacy_mode,
     )
 
 
@@ -815,3 +884,144 @@ def _global_stats_sync(path: Path) -> dict[str, int]:
 
 async def global_stats(path: str | Path) -> dict[str, int]:
     return await asyncio.to_thread(_global_stats_sync, Path(path))
+
+
+# --- Saved Prompts (#8) ---------------------------------------------------
+
+def _save_prompt_sync(path: Path, user_id: int, name: str, content: str) -> None:
+    with _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO saved_prompts (user_id, name, content, created_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, name) DO UPDATE SET content=excluded.content, created_at=excluded.created_at",
+            (user_id, name, content, _now()),
+        )
+
+
+async def save_prompt(path: str | Path, user_id: int, name: str, content: str) -> None:
+    """Save or overwrite a named prompt template for a user."""
+    await asyncio.to_thread(_save_prompt_sync, Path(path), user_id, name, content)
+
+
+def _list_saved_prompts_sync(path: Path, user_id: int) -> list[SavedPrompt]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, name, content, created_at FROM saved_prompts "
+            "WHERE user_id = ? ORDER BY name ASC",
+            (user_id,),
+        ).fetchall()
+    return [
+        SavedPrompt(id=r["id"], user_id=r["user_id"], name=r["name"],
+                    content=r["content"], created_at=r["created_at"])
+        for r in rows
+    ]
+
+
+async def list_saved_prompts(path: str | Path, user_id: int) -> list[SavedPrompt]:
+    return await asyncio.to_thread(_list_saved_prompts_sync, Path(path), user_id)
+
+
+def _delete_saved_prompt_sync(path: Path, user_id: int, name: str) -> bool:
+    with _connect(path) as conn:
+        cur = conn.execute(
+            "DELETE FROM saved_prompts WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        )
+        return cur.rowcount > 0
+
+
+async def delete_saved_prompt(path: str | Path, user_id: int, name: str) -> bool:
+    return await asyncio.to_thread(_delete_saved_prompt_sync, Path(path), user_id, name)
+
+
+# --- GDPR forgetme (#11) --------------------------------------------------
+
+def _forget_user_sync(path: Path, user_id: int) -> None:
+    """Delete ALL data for a user: sessions, messages, prefs, usage, saved prompts."""
+    with _connect(path) as conn:
+        # Get session IDs first for cascade
+        rows = conn.execute(
+            "SELECT id FROM sessions WHERE user_id = ?", (user_id,)
+        ).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (row["id"],))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_preferences WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM usage_log WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM saved_prompts WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM message_feedback WHERE user_id = ?", (user_id,))
+
+
+async def forget_user(path: str | Path, user_id: int) -> None:
+    """GDPR: permanently delete all user data."""
+    await asyncio.to_thread(_forget_user_sync, Path(path), user_id)
+
+
+# --- Audit Log (#28) -------------------------------------------------------
+
+def _log_audit_sync(
+    path: Path,
+    admin_id: int,
+    action: str,
+    target_id: int | None,
+    detail: str,
+) -> None:
+    with _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO audit_log (admin_id, action, target_id, detail, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (admin_id, action, target_id, detail, _now()),
+        )
+
+
+async def log_audit(
+    path: str | Path,
+    admin_id: int,
+    action: str,
+    target_id: int | None = None,
+    detail: str = "",
+) -> None:
+    await asyncio.to_thread(
+        _log_audit_sync, Path(path), admin_id, action, target_id, detail
+    )
+
+
+def _get_audit_log_sync(path: Path, limit: int) -> list[AuditEntry]:
+    with _connect(path) as conn:
+        rows = conn.execute(
+            "SELECT id, admin_id, action, target_id, detail, ts "
+            "FROM audit_log ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [
+        AuditEntry(
+            id=r["id"], admin_id=r["admin_id"], action=r["action"],
+            target_id=r["target_id"], detail=r["detail"], ts=r["ts"]
+        )
+        for r in rows
+    ]
+
+
+async def get_audit_log(path: str | Path, limit: int = 50) -> list[AuditEntry]:
+    return await asyncio.to_thread(_get_audit_log_sync, Path(path), limit)
+
+
+# --- Message Feedback (#7) ------------------------------------------------
+
+def _save_feedback_sync(
+    path: Path, user_id: int, session_id: int, message_id: int, feedback: str
+) -> None:
+    with _connect(path) as conn:
+        conn.execute(
+            "INSERT INTO message_feedback (user_id, session_id, message_id, feedback, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, session_id, message_id, feedback, _now()),
+        )
+
+
+async def save_feedback(
+    path: str | Path, user_id: int, session_id: int, message_id: int, feedback: str
+) -> None:
+    await asyncio.to_thread(
+        _save_feedback_sync, Path(path), user_id, session_id, message_id, feedback
+    )
