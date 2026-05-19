@@ -2663,11 +2663,16 @@ def main() -> None:
                 except (NotImplementedError, RuntimeError):
                     pass
 
-            await stop_event.wait()
-
-            logger.info("Stopping...")
-            await application.updater.stop()
-            await application.stop()
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.info("Stopping...")
+                if application.updater and application.updater.running:
+                    await application.updater.stop()
+                if application.running:
+                    await application.stop()
         await health_server.stop()
         await reminder_scheduler.stop()
         await tans_client.aclose()
