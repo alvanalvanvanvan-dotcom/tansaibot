@@ -45,11 +45,11 @@ class ReminderScheduler:
         if not self._available:
             return
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
         db_path = os.getenv("SCHEDULER_DB_PATH", "")
         jobstores = {}
         if db_path:
+            from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
             jobstores["default"] = SQLAlchemyJobStore(url=f"sqlite:///{db_path}")
 
         self._scheduler = AsyncIOScheduler(
