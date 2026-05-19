@@ -52,10 +52,15 @@ class ReminderScheduler:
             from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
             jobstores["default"] = SQLAlchemyJobStore(url=f"sqlite:///{db_path}")
 
-        self._scheduler = AsyncIOScheduler(
-            jobstores=jobstores or None,
-            timezone="UTC",
-        )
+        if jobstores:
+            self._scheduler = AsyncIOScheduler(
+                jobstores=jobstores,
+                timezone="UTC",
+            )
+        else:
+            self._scheduler = AsyncIOScheduler(
+                timezone="UTC",
+            )
         self._scheduler.start()
         logger.info("Reminder scheduler started (APScheduler)")
 
