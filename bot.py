@@ -2601,7 +2601,7 @@ def main() -> None:
         )
         logger.info("Sentry initialized")
 
-    application = build_application(cfg)
+    application = build_application()
     db_path: str = application.bot_data["db_path"]
     tans_client: TansAIClient = application.bot_data["tans_client"]
 
