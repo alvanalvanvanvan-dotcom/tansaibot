@@ -171,7 +171,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Login Screen -->
 <div id="login-screen">
   <div class="login-box">
-    <h2>🤖 tansaibot Admin</h2>
+    <h2>🤖 Admin Tans-AI</h2>
     <div id="login-error" class="alert alert-error" style="display:none"></div>
     <div class="form-group">
       <label>Username</label>
