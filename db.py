@@ -1150,22 +1150,6 @@ async def user_analytics(path: str | Path, user_id: int) -> dict:
     return await asyncio.to_thread(_user_analytics_sync, Path(path), user_id)
 
 
-# --- get_all_messages (for share.py #6) ------------------------------------
-
-def _get_all_messages_sync(path: Path, session_id: int) -> list[Message]:
-    with _connect(path) as conn:
-        rows = conn.execute(
-            "SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id ASC",
-            (session_id,),
-        ).fetchall()
-    return [Message(role=r["role"], content=r["content"], id=r["id"]) for r in rows]
-
-
-async def get_all_messages(path: str | Path, session_id: int) -> list[Message]:
-    """Return all messages in a session ordered by id (for HTML export)."""
-    return await asyncio.to_thread(_get_all_messages_sync, Path(path), session_id)
-
-
 # --- Reminders (#40) -------------------------------------------------------
 
 from dataclasses import dataclass as _dc  # noqa: E402
@@ -1230,30 +1214,6 @@ def _mark_reminder_sent_sync(path: Path, reminder_id: int) -> None:
 
 async def mark_reminder_sent(path: str | Path, reminder_id: int) -> None:
     await asyncio.to_thread(_mark_reminder_sent_sync, Path(path), reminder_id)
-
-
-# --- Admin dashboard helpers (#17) ----------------------------------------
-
-def _global_stats_sync(path: Path) -> dict:
-    with _connect(path) as conn:
-        users = conn.execute("SELECT COUNT(*) AS c FROM user_preferences").fetchone()
-        sessions = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()
-        messages = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()
-        tokens_row = conn.execute(
-            "SELECT COALESCE(SUM(tokens_in),0) AS ti, COALESCE(SUM(tokens_out),0) AS to2 FROM usage_log"
-        ).fetchone()
-    return {
-        "users": int(users["c"]) if users else 0,
-        "sessions": int(sessions["c"]) if sessions else 0,
-        "messages": int(messages["c"]) if messages else 0,
-        "tokens_in": int(tokens_row["ti"]) if tokens_row else 0,
-        "tokens_out": int(tokens_row["to2"]) if tokens_row else 0,
-    }
-
-
-async def global_stats(path: str | Path) -> dict:
-    """Return global bot statistics for admin dashboard."""
-    return await asyncio.to_thread(_global_stats_sync, Path(path))
 
 
 def _list_all_users_sync(path: Path, limit: int) -> list[dict]:

@@ -570,7 +570,7 @@ async def persona_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     prefs = await _ensure_prefs(db_path, update.effective_user.id, default_model)
     persona = personas.get(prefs.persona)
     lines = [
-        f"<b>Pilih persona AI</b>",
+        "<b>Pilih persona AI</b>",
         f"Aktif: {persona.emoji} <b>{ui.escape(persona.label)}</b>",
         f"<i>{ui.escape(persona.description)}</i>",
         "",
@@ -3055,7 +3055,7 @@ async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if is_dup:
         await update.message.reply_text(
-            f"ℹ️ Fakta ini sudah tersimpan sebelumnya.",
+            "ℹ️ Fakta ini sudah tersimpan sebelumnya.",
         )
         return
 
@@ -3212,7 +3212,7 @@ async def summarize_url_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not url.startswith("http"):
         url = "https://" + url
 
-    placeholder = await update.message.reply_text(f"⏳ Mengambil konten dari URL...")
+    placeholder = await update.message.reply_text("⏳ Mengambil konten dari URL...")
 
     page_text = await summarize_url(url)
     if page_text.startswith("Gagal"):

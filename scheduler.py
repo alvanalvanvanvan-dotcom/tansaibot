@@ -80,8 +80,6 @@ class ReminderScheduler:
         if not self._available or self._scheduler is None:
             return False
 
-        from apscheduler.triggers.date import DateTrigger
-
         # Ensure UTC
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
