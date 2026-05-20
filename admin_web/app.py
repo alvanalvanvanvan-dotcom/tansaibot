@@ -21,6 +21,8 @@ import os
 import sys
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 # Add parent dir to path so we can import db
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -683,12 +685,62 @@ if _FASTAPI_AVAILABLE:
         target = body.get("target", "all")
         if not message:
             raise HTTPException(status_code=400, detail="Message is empty")
+        
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            raise HTTPException(status_code=500, detail="TELEGRAM_BOT_TOKEN not found in .env")
+
+        # Fetch users
+        users = await db.list_all_users(DB_PATH, limit=1000)
+        target_ids = []
+        for u in users:
+            if u.get("status") == "banned":
+                continue
+            if target == "premium" and u.get("tier") != "premium":
+                continue
+            target_ids.append(u["user_id"])
+
+        if not target_ids:
+            return {"message": "Tidak ada user penerima yang aktif."}
+
+        import httpx
+        import asyncio
+
+        success_count = 0
+        fail_count = 0
+
+        async def send_msg(uid: int):
+            nonlocal success_count, fail_count
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(url, json={
+                        "chat_id": uid,
+                        "text": message,
+                        "parse_mode": "HTML"
+                    })
+                    if resp.status_code == 200:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+            except Exception:
+                fail_count += 1
+
+        # Process concurrently with rate limiting helper (Semaphore)
+        sem = asyncio.Semaphore(10)
+        async def safe_send(uid: int):
+            async with sem:
+                await send_msg(uid)
+                await asyncio.sleep(0.05)
+
+        await asyncio.gather(*(safe_send(uid) for uid in target_ids))
+
         await db.log_audit(
             DB_PATH, admin_id=0,
             action="broadcast",
-            detail=f"target={target} msg={message[:200]} via={admin}"
+            detail=f"target={target} msg={message[:200]} success={success_count} fail={fail_count} via={admin}"
         )
-        return {"message": f"Broadcast queued untuk target '{target}'. Bot akan mengirim saat berjalan."}
+        return {"message": f"Broadcast terkirim ke {success_count} user (Gagal: {fail_count})."}
 
     # --- Analytics ---
     @app.get("/admin/api/analytics")
