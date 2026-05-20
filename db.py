@@ -46,10 +46,12 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     onboarded            INTEGER NOT NULL DEFAULT 0,
     status               TEXT NOT NULL DEFAULT 'active',
     display_name         TEXT NOT NULL DEFAULT '',
-    tts_enabled          INTEGER NOT NULL DEFAULT 0,
+    tts_enabled          INTEGER NOT NULL DEFAULT 1,
     privacy_mode         TEXT NOT NULL DEFAULT 'normal',
     long_term_memory     TEXT NOT NULL DEFAULT '[]',
     tier                 TEXT NOT NULL DEFAULT 'free',
+    rate_limit_minute    INTEGER,
+    rate_limit_day       INTEGER,
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL
 );
@@ -155,14 +157,6 @@ _USER_PREFS_MIGRATIONS: list[tuple[str, str]] = [
         "privacy_mode",
         "ALTER TABLE user_preferences ADD COLUMN privacy_mode TEXT NOT NULL DEFAULT 'normal'",
     ),
-    (
-        "long_term_memory",
-        "ALTER TABLE user_preferences ADD COLUMN long_term_memory TEXT NOT NULL DEFAULT '[]'",
-    ),
-    (
-        "tier",
-        "ALTER TABLE user_preferences ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'",
-    ),
 ]
 
 # Valid status values for user access.
@@ -208,6 +202,8 @@ class UserPrefs:
     privacy_mode: str
     long_term_memory: str = "[]"  # JSON list of strings (#35)
     tier: str = "free"            # free | premium | admin (#45)
+    rate_limit_minute: int | None = None
+    rate_limit_day: int | None = None
     created_at: str = ""
     updated_at: str = ""
 
@@ -267,6 +263,26 @@ def _apply_session_migrations(conn: sqlite3.Connection) -> None:
 
 
 def _apply_user_prefs_migrations(conn: sqlite3.Connection) -> None:
+    """Migrate user_preferences table by adding new columns safely."""
+    # (#35) long term memory
+    try:
+        conn.execute("ALTER TABLE user_preferences ADD COLUMN long_term_memory TEXT NOT NULL DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass
+    # (#45) tier
+    try:
+        conn.execute("ALTER TABLE user_preferences ADD COLUMN tier TEXT NOT NULL DEFAULT 'free'")
+    except sqlite3.OperationalError:
+        pass
+    # (Tier L) rate limits
+    try:
+        conn.execute("ALTER TABLE user_preferences ADD COLUMN rate_limit_minute INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE user_preferences ADD COLUMN rate_limit_day INTEGER")
+    except sqlite3.OperationalError:
+        pass
     existing = _existing_columns(conn, "user_preferences")
     for column, ddl in _USER_PREFS_MIGRATIONS:
         if column not in existing:
@@ -671,6 +687,8 @@ def _get_user_prefs_sync(path: Path, user_id: int) -> UserPrefs | None:
         privacy_mode=row["privacy_mode"] if "privacy_mode" in keys else "normal",
         long_term_memory=row["long_term_memory"] if "long_term_memory" in keys else "[]",
         tier=row["tier"] if "tier" in keys else "free",
+        rate_limit_minute=row["rate_limit_minute"] if "rate_limit_minute" in keys else None,
+        rate_limit_day=row["rate_limit_day"] if "rate_limit_day" in keys else None,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -695,33 +713,39 @@ def _upsert_user_prefs_sync(
     privacy_mode: str | None = None,
     long_term_memory: str | None = None,
     tier: str | None = None,
+    rate_limit_minute: int | None = None,
+    rate_limit_day: int | None = None,
 ) -> None:
-    now = _now()
+    ts = _now()
     with _connect(path) as conn:
         existing = conn.execute(
             "SELECT 1 FROM user_preferences WHERE user_id = ?", (user_id,)
         ).fetchone()
         if existing is None:
             conn.execute(
-                "INSERT INTO user_preferences (user_id, default_model, persona, "
+                "INSERT INTO user_preferences ("
+                "user_id, default_model, persona, "
                 "custom_system_prompt, ui_language, onboarded, status, "
-                "display_name, tts_enabled, privacy_mode, long_term_memory, tier, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "display_name, tts_enabled, privacy_mode, long_term_memory, tier, "
+                "rate_limit_minute, rate_limit_day, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     default_model or "",
                     persona or "default",
                     custom_system_prompt or "",
                     ui_language or "id",
-                    1 if onboarded else 0,
+                    int(bool(onboarded)),
                     status or STATUS_ACTIVE,
                     display_name or "",
-                    1 if tts_enabled else 0,
+                    int(tts_enabled) if tts_enabled is not None else 1,
                     privacy_mode or "normal",
                     long_term_memory or "[]",
                     tier or "free",
-                    now,
-                    now,
+                    rate_limit_minute,
+                    rate_limit_day,
+                    ts,
+                    ts,
                 ),
             )
             return
@@ -760,10 +784,17 @@ def _upsert_user_prefs_sync(
         if tier is not None:
             fields.append("tier = ?")
             params.append(tier)
+        if rate_limit_minute is not None:
+            fields.append("rate_limit_minute = ?")
+            params.append(rate_limit_minute)
+        if rate_limit_day is not None:
+            fields.append("rate_limit_day = ?")
+            params.append(rate_limit_day)
+        
         if not fields:
             return
         fields.append("updated_at = ?")
-        params.append(now)
+        params.append(ts)
         params.append(user_id)
         conn.execute(
             f"UPDATE user_preferences SET {', '.join(fields)} WHERE user_id = ?",
@@ -786,6 +817,8 @@ async def upsert_user_prefs(
     privacy_mode: str | None = None,
     long_term_memory: str | None = None,
     tier: str | None = None,
+    rate_limit_minute: int | None = None,
+    rate_limit_day: int | None = None,
 ) -> None:
     await asyncio.to_thread(
         _upsert_user_prefs_sync,
@@ -802,6 +835,8 @@ async def upsert_user_prefs(
         privacy_mode=privacy_mode,
         long_term_memory=long_term_memory,
         tier=tier,
+        rate_limit_minute=rate_limit_minute,
+        rate_limit_day=rate_limit_day,
     )
 
 
