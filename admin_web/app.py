@@ -216,9 +216,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <p class="section-title">Quick Actions</p>
       <div style="display:flex;gap:.75rem;flex-wrap:wrap">
-        <button class="btn btn-primary" onclick="loadUsers()">🔄 Refresh Users</button>
+        <button class="btn btn-primary" onclick="showTab('users')">🔄 Refresh Users</button>
         <button class="btn btn-success" onclick="showTab('broadcast')">📢 Broadcast Message</button>
-        <button class="btn btn-primary" onclick="loadAudit()">📋 View Audit Log</button>
+        <button class="btn btn-primary" onclick="showTab('audit')">📋 View Audit Log</button>
       </div>
     </div>
 
