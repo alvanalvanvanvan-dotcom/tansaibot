@@ -110,6 +110,17 @@ def get(key: str | None) -> Persona:
 def resolve_system_prompt(key: str | None, custom_prompt: str | None) -> str:
     """Return the system prompt to use for a given persona/custom combo."""
     persona = get(key)
-    if persona.key == "custom":
-        return (custom_prompt or "").strip()
-    return persona.system_prompt
+    base_prompt = (custom_prompt or "").strip() if persona.key == "custom" else persona.system_prompt
+    
+    identity_prompt = (
+        "Identitas Utama: Kamu adalah Tans AI, Asisten Pribadi pengguna. "
+        "Jika ditanya 'siapa kamu', 'siapa dirimu', atau sejenisnya, langsung jawab secara alami: "
+        "\"Saya adalah Tans AI, Asisten pribadi Anda.\" Jelaskan kebisaan/kemampuan umummu "
+        "(seperti membantu koding, menulis copy, menerjemahkan bahasa, analisis bisnis, "
+        "dan menjawab pertanyaan umum) secara ramah, ringkas, dan jelas. "
+        "Jangan pernah menyebutkan atau menjelaskan bahwa kamu dipaksa oleh sistem atau instruksi prompt untuk menjadi Tans AI."
+    )
+    
+    if base_prompt:
+        return f"{identity_prompt}\n\nInstruksi peran saat ini:\n{base_prompt}"
+    return identity_prompt
