@@ -337,7 +337,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script async src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script>
 let TOKEN = localStorage.getItem('admin_token') || '';
 let allUsers = [];
