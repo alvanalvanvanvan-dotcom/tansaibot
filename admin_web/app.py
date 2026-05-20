@@ -366,7 +366,7 @@ async function doLogin() {
     loadDashboard();
   } else {
     const err = document.getElementById('login-error');
-    err.textContent = d.detail || 'Login gagal';
+    err.textContent = 'Password salah, silahkan hubungi admin.';
     err.style.display = 'block';
   }
 }
@@ -524,7 +524,7 @@ async function viewChat(sid, title) {
   document.getElementById('chat-modal').classList.add('show');
   const msgs = await api('/sessions/'+sid+'/messages');
   if (!msgs || !msgs.length) { document.getElementById('chat-modal-body').innerHTML='<div style="text-align:center;color:#484f58">No messages</div>'; return; }
-  document.getElementById('chat-modal-body').innerHTML = msgs.map(m=>`<div class="chat-msg ${m.role}"><div class="chat-role">${m.role}</div><div>${m.content.replace(/</g,'&lt;').replace(/\n/g,'<br>')}</div></div>`).join('');
+  document.getElementById('chat-modal-body').innerHTML = msgs.map(m=>{const safe=m.content.replace(/\x3c/g,'&lt;').replace(/\\n/g,'<br>');return '<div class="chat-msg '+m.role+'"><div class="chat-role">'+m.role+'</div><div>'+safe+'</div></div>';}).join('');
 }
 function closeChatModal() { document.getElementById('chat-modal').classList.remove('show'); }
 
