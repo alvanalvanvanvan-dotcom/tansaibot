@@ -140,30 +140,170 @@ def get_excel_system_prompt(user_message: str) -> str:
 
 
 def get_code_system_prompt(user_message: str) -> str:
-    """Instruksi sistem agar AI menghasilkan kode yang bersih dan siap pakai."""
+    """Instruksi sistem agar AI menghasilkan kode yang bersih, valid, dan siap pakai."""
     return (
         "\n\n[INSTRUKSI WAJIB — OUTPUT KODE PROGRAM]\n"
-        "User meminta kode program. Kamu HARUS mematuhi aturan berikut:\n"
-        "1. Tulis kode yang LENGKAP, BENAR, dan SIAP DIJALANKAN — bukan pseudocode.\n"
+        "User meminta kode program. Kamu HARUS mematuhi SEMUA aturan berikut:\n\n"
+
+        "=== BAGIAN 1: VALIDASI KODE ===\n"
+        "Sebelum memberikan kode, lakukan pengecekan mandiri:\n"
+        "- Pastikan TIDAK ada syntax error, typo, atau logic error.\n"
+        "- Pastikan semua variabel sudah dideklarasikan sebelum digunakan.\n"
+        "- Pastikan semua fungsi yang dipanggil sudah didefinisikan.\n"
+        "- Pastikan semua import/require library yang digunakan sudah disertakan.\n"
+        "- Kode harus LANGSUNG bisa dijalankan tanpa modifikasi.\n\n"
+
+        "=== BAGIAN 2: FORMAT PENULISAN KODE ===\n"
+        "1. Tulis kode yang LENGKAP dan BENAR — bukan pseudocode atau placeholder.\n"
         "2. WAJIB sertakan nama file di baris PERTAMA sebagai komentar:\n"
         "   - Python : # File: nama_file.py\n"
         "   - HTML   : <!-- File: index.html -->\n"
         "   - JS/TS  : // File: script.js\n"
         "   - CSS    : /* File: style.css */\n"
         "   - Java   : // File: Main.java\n"
-        "3. Bungkus setiap file dalam fenced code block dengan bahasa yang benar:\n"
-        "   ```python\n   # File: nama.py\n   # kode di sini\n   ```\n"
-        "4. Sertakan SEMUA import/require yang dibutuhkan.\n"
-        "5. Tambahkan komentar/dokumentasi minimal di setiap fungsi utama.\n"
-        "6. Jika ada beberapa file, tulis MASING-MASING dalam code block TERPISAH.\n"
-        "7. Setelah semua kode, berikan cara singkat menjalankan program.\n"
+        "   - PHP    : // File: index.php\n"
+        "3. Bungkus setiap file dalam fenced code block yang benar:\n"
+        "   ```python\n   # File: nama.py\n   # kode\n   ```\n"
+        "4. Jika ada beberapa file, tulis MASING-MASING dalam code block TERPISAH.\n"
+        "5. Sertakan komentar/dokumentasi minimal di setiap fungsi utama.\n\n"
+
+        "=== BAGIAN 3: WAJIB SERTAKAN SETELAH KODE ===\n"
+        "Setelah semua blok kode, WAJIB tulis bagian berikut:\n\n"
+        "## Struktur File\n"
+        "Jelaskan struktur folder/file yang dibutuhkan. Contoh:\n"
+        "```\n"
+        "project/\n"
+        "├── index.html\n"
+        "├── css/\n"
+        "│   └── style.css\n"
+        "└── js/\n"
+        "    └── script.js\n"
+        "```\n\n"
+        "## Dependensi\n"
+        "Daftar library/package yang perlu diinstall (jika ada). Contoh:\n"
+        "- pip install flask requests\n"
+        "- npm install express\n\n"
+        "## Cara Menjalankan\n"
+        "Instruksi LENGKAP cara menjalankan program. Contoh:\n"
+        "1. Buka terminal/cmd\n"
+        "2. Masuk ke folder: cd project/\n"
+        "3. Install dependensi: pip install -r requirements.txt\n"
+        "4. Jalankan: python main.py\n"
+        "5. Buka browser: http://localhost:5000\n\n"
         f"Permintaan user: {user_message[:400]}"
     )
 
 
-# ---------------------------------------------------------------------------
-# Public — File builders
-# ---------------------------------------------------------------------------
+def extract_project_guide(ai_reply: str) -> dict[str, str]:
+    """Ekstrak panduan proyek dari reply AI.
+
+    Mencari section '## Struktur File', '## Dependensi', dan
+    '## Cara Menjalankan' dari reply AI dan mengembalikannya
+    sebagai dict.
+
+    Returns dict with keys: 'structure', 'dependencies', 'run_instructions'.
+    Nilai kosong string jika section tidak ditemukan.
+    """
+    result = {"structure": "", "dependencies": "", "run_instructions": ""}
+
+    # Cari section berdasarkan heading Markdown (case-insensitive)
+    # Heading bisa ## atau ### atau **Judul**
+    section_patterns = [
+        ("structure",       [r"##+ *struktur file", r"##+ *file structure",
+                              r"##+ *struktur folder", r"\*\*struktur file\*\*"]),
+        ("dependencies",    [r"##+ *dependensi", r"##+ *dependencies",
+                              r"##+ *requirements", r"\*\*dependensi\*\*"]),
+        ("run_instructions", [r"##+ *cara menjalankan", r"##+ *how to run",
+                              r"##+ *cara run", r"##+ *menjalankan",
+                              r"\*\*cara menjalankan\*\*"]),
+    ]
+
+    # Pisahkan reply menjadi blok per section
+    # Anggap setiap section dimulai dari heading sampai heading berikutnya
+    for key, patterns in section_patterns:
+        for pat in patterns:
+            match = re.search(pat, ai_reply, re.IGNORECASE)
+            if match:
+                start = match.end()
+                # Cari heading berikutnya (## atau **...)
+                next_heading = re.search(
+                    r"\n(##+ |\*\*[A-Z])", ai_reply[start:], re.IGNORECASE
+                )
+                end = start + next_heading.start() if next_heading else len(ai_reply)
+                content = ai_reply[start:end].strip()
+                if content:
+                    result[key] = content
+                break
+
+    return result
+
+
+def format_project_guide_message(guide: dict[str, str], filenames: list[str]) -> str:
+    """Format panduan proyek menjadi pesan Telegram yang informatif."""
+    lines: list[str] = []
+    lines.append("📋 <b>Panduan Proyek</b>")
+    lines.append("")
+
+    # Daftar file yang dikirim
+    if filenames:
+        lines.append("📦 <b>File yang dikirim:</b>")
+        for fname in filenames:
+            lines.append(f"  📄 <code>{fname}</code>")
+        lines.append("")
+
+    # Struktur file
+    if guide.get("structure"):
+        lines.append("📁 <b>Cara Menyimpan / Struktur Folder:</b>")
+        # Tampilkan kode block jika ada
+        struct_text = guide["structure"]
+        # Cek apakah ada fenced code block di dalamnya
+        code_match = re.search(r"```.*?```", struct_text, re.DOTALL)
+        if code_match:
+            inner = code_match.group(0).strip("`").strip()
+            lines.append(f"<pre>{_escape_html(inner)}</pre>")
+        else:
+            lines.append(f"<pre>{_escape_html(struct_text[:800])}</pre>")
+        lines.append("")
+
+    # Dependensi
+    if guide.get("dependencies"):
+        dep_text = guide["dependencies"].strip()
+        # Hanya tampilkan jika ada isi yang bermakna
+        dep_clean = re.sub(r"```.*?```", "", dep_text, flags=re.DOTALL).strip()
+        dep_clean = re.sub(r"[*_`]", "", dep_clean).strip()
+        if dep_clean and dep_clean.lower() not in ("tidak ada", "none", "-", "–"):
+            lines.append("📦 <b>Dependensi yang perlu diinstall:</b>")
+            lines.append(f"<pre>{_escape_html(dep_clean[:600])}</pre>")
+            lines.append("")
+
+    # Cara menjalankan
+    if guide.get("run_instructions"):
+        lines.append("▶️ <b>Cara Menjalankan:</b>")
+        run_text = guide["run_instructions"].strip()
+        # Bersihkan markdown formatting ringan
+        run_clean = re.sub(r"```.*?```", "", run_text, flags=re.DOTALL).strip()
+        run_clean = re.sub(r"[*_]", "", run_clean).strip()
+        if run_clean:
+            lines.append(run_clean[:1000])
+        lines.append("")
+
+    if len(lines) <= 3:
+        # Tidak ada info panduan — berikan pesan generik
+        return ""
+
+    return "\n".join(lines).strip()
+
+
+def _escape_html(text: str) -> str:
+    """Escape karakter HTML agar aman ditampilkan di Telegram HTML mode."""
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
 
 async def build_excel_from_ai(ai_reply: str, filename: str = "output") -> io.BytesIO | None:
     """Buat file Excel .xlsx dengan styling profesional dari reply AI."""

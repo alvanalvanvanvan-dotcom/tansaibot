@@ -1942,6 +1942,7 @@ async def _send_ai_reply(
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
             code_files = await file_generator.build_code_files(reply, fallback_name=fallback_name)
             if code_files:
+                sent_filenames: list[str] = []
                 for code_buf, code_fname, code_warnings in code_files:
                     # Tampilkan peringatan validasi jika ada
                     warn_text = ""
@@ -1958,6 +1959,19 @@ async def _send_ai_reply(
                         filename=code_fname,
                         caption=caption,
                         parse_mode=ParseMode.HTML,
+                    )
+                    sent_filenames.append(code_fname)
+
+                # Kirim panduan proyek setelah semua file terkirim
+                guide = file_generator.extract_project_guide(reply)
+                guide_msg = file_generator.format_project_guide_message(
+                    guide, sent_filenames
+                )
+                if guide_msg:
+                    await target.reply_text(
+                        guide_msg,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
                     )
             else:
                 await target.reply_text(
