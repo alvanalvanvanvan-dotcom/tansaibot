@@ -39,3 +39,6 @@ psutil>=5.9.0
 
 # File generation (Excel + code ZIP)
 openpyxl>=3.1.2
+
+# Text-to-Speech fallback (free, no API key needed)
+gTTS>=2.5.0

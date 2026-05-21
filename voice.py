@@ -4,15 +4,76 @@ The Tans AI gateway used by this bot is text-in/text-out, so voice is wired
 up against an OpenAI-compatible API (``/audio/transcriptions`` and
 ``/audio/speech``). It is fully optional: when ``VOICE_API_KEY`` is empty the
 bot simply tells voice users to type instead.
+
+Fallback TTS: gTTS (Google Text-to-Speech) is used automatically when
+``VOICE_API_KEY`` is not configured. gTTS is free, no API key needed.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 from dataclasses import dataclass
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# gTTS — free fallback TTS (no API key needed)
+try:
+    from gtts import gTTS as _gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+    logger.debug("gTTS not installed — free TTS fallback unavailable. pip install gTTS")
+
+
+async def synthesize_gtts(text: str, lang: str = "id") -> bytes:
+    """Buat audio dari teks menggunakan gTTS (Google TTS — gratis, tanpa API key).
+
+    Args:
+        text: Teks yang akan diubah menjadi suara (maks 3000 karakter).
+        lang: Kode bahasa ISO 639-1. Default 'id' (Indonesia).
+              Deteksi otomatis: jika teks mengandung banyak huruf non-ASCII
+              atau kata-kata Inggris, gunakan 'id' untuk aksen netral.
+
+    Returns:
+        bytes: Audio MP3 siap dikirim sebagai Telegram voice.
+
+    Raises:
+        VoiceError: Jika gTTS tidak terinstall atau request gagal.
+    """
+    if not GTTS_AVAILABLE:
+        raise VoiceError(
+            "gTTS tidak terinstall. Jalankan: pip install gTTS"
+        )
+    if not text.strip():
+        raise VoiceError("Teks kosong — tidak bisa diubah ke suara.")
+
+    text = text[:3000]
+
+    # Bersihkan teks dari format Markdown / HTML agar suara lebih natural
+    import re
+    clean = re.sub(r"<[^>]+>", "", text)          # strip HTML tags
+    clean = re.sub(r"[*_`#~]+", "", clean)         # strip Markdown
+    clean = re.sub(r"https?://\S+", "link", clean) # ganti URL dengan 'link'
+    clean = clean.strip()
+    if not clean:
+        raise VoiceError("Teks kosong setelah pembersihan.")
+
+    def _run_gtts() -> bytes:
+        tts = _gTTS(text=clean, lang=lang, slow=False)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+
+    try:
+        audio_bytes = await asyncio.to_thread(_run_gtts)
+        return audio_bytes
+    except Exception as exc:
+        raise VoiceError(f"gTTS gagal: {exc}") from exc
+
 
 
 class VoiceError(Exception):

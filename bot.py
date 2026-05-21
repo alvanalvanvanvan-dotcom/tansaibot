@@ -2215,6 +2215,95 @@ async def tts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# --- /suarakan <teks> — on-demand TTS (dengan fallback gTTS gratis) ----------
+
+async def suarakan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ubah teks menjadi pesan suara (voice note).
+
+    Penggunaan:
+      /suarakan Halo, apa kabar?
+      /suarakan [balas pesan teks]
+
+    Prioritas TTS engine:
+      1. OpenAI/compatible API (jika VOICE_API_KEY dikonfigurasi)
+      2. gTTS — Google TTS gratis (otomatis fallback)
+    """
+    if update.message is None or update.effective_user is None:
+        return
+    msg = update.message
+
+    prefs, deny = await _admit(update, context)
+    if prefs is None:
+        return
+    if deny:
+        await msg.reply_text(deny, parse_mode=ParseMode.HTML)
+        return
+
+    # Ambil teks dari args atau dari reply message
+    args_text = " ".join(context.args or []).strip()
+    reply_text = ""
+    if msg.reply_to_message and msg.reply_to_message.text:
+        reply_text = msg.reply_to_message.text.strip()
+
+    text_to_speak = args_text or reply_text
+    if not text_to_speak:
+        await msg.reply_text(
+            "🔊 <b>Cara pakai:</b>\n"
+            "• <code>/suarakan Teks yang ingin disuarakan</code>\n"
+            "• Atau balas pesan teks dengan <code>/suarakan</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Batasi panjang teks
+    if len(text_to_speak) > 3000:
+        text_to_speak = text_to_speak[:3000]
+        await msg.reply_text(
+            "⚠️ Teks terlalu panjang, dipotong di 3000 karakter.",
+        )
+
+    chat_id = update.effective_chat.id if update.effective_chat else update.effective_user.id
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+
+    # Deteksi bahasa (sederhana: cek apakah mayoritas ASCII → 'en', lainnya → 'id')
+    non_ascii = sum(1 for c in text_to_speak if ord(c) > 127)
+    lang = "id" if non_ascii < len(text_to_speak) * 0.3 else "id"
+
+    # Coba OpenAI-compatible TTS dulu, lalu fallback ke gTTS
+    vc: voice_mod.VoiceClient | None = context.application.bot_data.get("voice_client")
+    audio_bytes: bytes | None = None
+    engine_used = ""
+
+    if vc is not None and vc.enabled:
+        try:
+            audio_bytes = await vc.synthesize(text_to_speak)
+            engine_used = "OpenAI TTS"
+        except voice_mod.VoiceError as exc:
+            logger.warning("OpenAI TTS failed, falling back to gTTS: %s", exc)
+
+    if audio_bytes is None:
+        try:
+            audio_bytes = await voice_mod.synthesize_gtts(text_to_speak, lang=lang)
+            engine_used = "Google TTS"
+        except voice_mod.VoiceError as exc:
+            await msg.reply_text(
+                f"❌ Gagal menghasilkan suara: {exc}\n"
+                "Pastikan koneksi internet aktif.",
+            )
+            return
+
+    try:
+        await context.bot.send_voice(
+            chat_id=chat_id,
+            voice=audio_bytes,
+            caption=f"🔊 <i>{ui.escape(text_to_speak[:80])}{'…' if len(text_to_speak) > 80 else ''}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("send_voice failed in suarakan_command")
+        await msg.reply_text("❌ Gagal mengirim file suara. Coba lagi.")
+
+
 # --- Voice messages (STT) ---------------------------------------------------
 
 async def voice_message(
@@ -2417,7 +2506,8 @@ PUBLIC_BOT_COMMANDS: list[tuple[str, str]] = [
     ("quick", "Template prompt cepat"),
     ("settings", "Buka menu pengaturan"),
     ("export", "Export sesi ke Markdown"),
-    ("tts", "On/off voice reply (TTS)"),
+    ("tts", "On/off auto-voice reply setiap jawaban AI"),
+    ("suarakan", "Ubah teks/pesan menjadi voice note 🔊"),
     ("stats", "Statistik penggunaan Anda"),
     ("status", "Cek koneksi ke Tans AI"),
     ("reset", "Reset preferensi ke default"),
@@ -2558,6 +2648,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("waitlist", waitlist_command))
     application.add_handler(CommandHandler("users", users_command))
     application.add_handler(CommandHandler("tts", tts_command))
+    application.add_handler(CommandHandler("suarakan", suarakan_command))  # on-demand TTS
     application.add_handler(CommandHandler("cancel", cancel_command))
     # v2 Tier-S handlers
     application.add_handler(CommandHandler("forgetme", forgetme_command))       # (#11)
