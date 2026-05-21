@@ -2245,12 +2245,26 @@ async def suarakan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if msg.reply_to_message and msg.reply_to_message.text:
         reply_text = msg.reply_to_message.text.strip()
 
-    text_to_speak = args_text or reply_text
+    raw_text = args_text or reply_text
+
+    # Deteksi flag pilihan suara
+    voice_type = "female"  # default
+    if re.match(r"^(-cowok|-pria)\b", raw_text, re.IGNORECASE):
+        voice_type = "male"
+        raw_text = re.sub(r"^(-cowok|-pria)\s*", "", raw_text, flags=re.IGNORECASE)
+    elif re.match(r"^(-cewek|-wanita)\b", raw_text, re.IGNORECASE):
+        voice_type = "female"
+        raw_text = re.sub(r"^(-cewek|-wanita)\s*", "", raw_text, flags=re.IGNORECASE)
+
+    text_to_speak = raw_text.strip()
     if not text_to_speak:
         await msg.reply_text(
             "🔊 <b>Cara pakai:</b>\n"
             "• <code>/suarakan Teks yang ingin disuarakan</code>\n"
-            "• Atau balas pesan teks dengan <code>/suarakan</code>",
+            "• Atau balas pesan dengan <code>/suarakan</code>\n\n"
+            "<b>Pilihan Suara (Opsional):</b>\n"
+            "Tambahkan <code>-cowok</code> atau <code>-cewek</code> di awal.\n"
+            "Contoh: <code>/suarakan -cowok Halo semua!</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -2283,8 +2297,13 @@ async def suarakan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if audio_bytes is None:
         try:
-            audio_bytes = await voice_mod.synthesize_gtts(text_to_speak, lang=lang)
-            engine_used = "Google TTS"
+            if voice_mod.EDGE_TTS_AVAILABLE:
+                edge_voice_id = "id-ID-ArdiNeural" if voice_type == "male" else "id-ID-GadisNeural"
+                audio_bytes = await voice_mod.synthesize_edge_tts(text_to_speak, voice=edge_voice_id)
+                engine_used = "Edge TTS"
+            else:
+                audio_bytes = await voice_mod.synthesize_gtts(text_to_speak, lang=lang)
+                engine_used = "Google TTS"
         except voice_mod.VoiceError as exc:
             await msg.reply_text(
                 f"❌ Gagal menghasilkan suara: {exc}\n"

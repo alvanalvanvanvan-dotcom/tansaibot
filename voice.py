@@ -17,15 +17,59 @@ from dataclasses import dataclass
 
 import httpx
 
+
 logger = logging.getLogger(__name__)
 
-# gTTS — free fallback TTS (no API key needed)
+# edge-tts — free fallback TTS with high-quality neural voices
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
+    logger.debug("edge-tts not installed. pip install edge-tts")
+
+# gTTS — fallback of the fallback
 try:
     from gtts import gTTS as _gTTS
     GTTS_AVAILABLE = True
 except ImportError:
     GTTS_AVAILABLE = False
-    logger.debug("gTTS not installed — free TTS fallback unavailable. pip install gTTS")
+    logger.debug("gTTS not installed. pip install gTTS")
+
+
+async def synthesize_edge_tts(text: str, voice: str = "id-ID-GadisNeural") -> bytes:
+    """Buat audio dari teks menggunakan edge-tts (Neural voices — gratis).
+
+    Voices ID (Indonesia):
+      - Female: id-ID-GadisNeural
+      - Male:   id-ID-ArdiNeural
+    """
+    if not EDGE_TTS_AVAILABLE:
+        raise VoiceError("edge-tts tidak terinstall.")
+    if not text.strip():
+        raise VoiceError("Teks kosong — tidak bisa diubah ke suara.")
+
+    text = text[:3000]
+
+    # Bersihkan teks (strip HTML & Markdown)
+    import re
+    clean = re.sub(r"<[^>]+>", "", text)
+    clean = re.sub(r"[*_`#~]+", "", clean)
+    clean = re.sub(r"https?://\S+", "link", clean)
+    clean = clean.strip()
+    if not clean:
+        raise VoiceError("Teks kosong setelah pembersihan.")
+
+    buf = io.BytesIO()
+    try:
+        communicate = edge_tts.Communicate(clean, voice)
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+        buf.seek(0)
+        return buf.read()
+    except Exception as exc:
+        raise VoiceError(f"edge-tts gagal: {exc}") from exc
 
 
 async def synthesize_gtts(text: str, lang: str = "id") -> bytes:
