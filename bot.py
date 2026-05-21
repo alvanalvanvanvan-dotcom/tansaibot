@@ -1936,27 +1936,34 @@ async def _send_ai_reply(
                     "⚠️ Tidak bisa membuat file Excel. Pastikan library <code>openpyxl</code> terinstall.",
                     parse_mode=ParseMode.HTML,
                 )
+
         elif file_intent == "code":
-            fname = file_generator.derive_filename(user_message, "code")
+            fallback_name = file_generator.derive_filename(user_message, "code")
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-            code_result = await file_generator.build_code_file(reply, filename=fname)
-            if code_result:
-                code_buf, code_fname = code_result
-                await target.reply_document(
-                    document=code_buf,
-                    filename=code_fname,
-                    caption=(
+            code_files = await file_generator.build_code_files(reply, fallback_name=fallback_name)
+            if code_files:
+                for code_buf, code_fname, code_warnings in code_files:
+                    # Tampilkan peringatan validasi jika ada
+                    warn_text = ""
+                    if code_warnings:
+                        warn_lines = "\n".join(f"  ⚠️ {w}" for w in code_warnings)
+                        warn_text = f"\n\n<b>Catatan validator:</b>\n{warn_lines}"
+                    caption = (
                         f"💾 <b>File kode siap!</b>\n"
-                        f"📄 <code>{code_fname}</code>\n"
-                        "Langsung bisa dijalankan. Cek README.md jika file ZIP."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
+                        f"📄 <code>{code_fname}</code>"
+                        f"{warn_text}"
+                    )
+                    await target.reply_document(
+                        document=code_buf,
+                        filename=code_fname,
+                        caption=caption,
+                        parse_mode=ParseMode.HTML,
+                    )
             else:
                 await target.reply_text(
-                    "⚠️ AI tidak menghasilkan blok kode yang valid. "
-                    "Coba perjelas permintaanmu, misalnya: "
-                    "<i>'Buatkan program Python untuk ...'</i>",
+                    "⚠️ AI tidak menghasilkan blok kode yang valid.\n"
+                    "Coba perjelas permintaanmu, misalnya:\n"
+                    "<i>'Buatkan program Python untuk menghitung luas lingkaran'</i>",
                     parse_mode=ParseMode.HTML,
                 )
     except Exception:
