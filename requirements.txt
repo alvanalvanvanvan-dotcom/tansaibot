@@ -36,3 +36,6 @@ python-multipart>=0.0.6
 
 # System Health monitoring
 psutil>=5.9.0
+
+# File generation (Excel + code ZIP)
+openpyxl>=3.1.2

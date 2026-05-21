@@ -84,6 +84,7 @@ from rag import RAGStore
 from tools import get_default_registry
 from sandbox import execute_code, format_result as format_sandbox_result
 import payment
+import file_generator
 
 logger = logging.getLogger(__name__)
 
@@ -1834,6 +1835,13 @@ async def _send_ai_reply(
         tool_registry = get_default_registry()
         prompt += f"\n\n{tool_registry.get_spec_text()}"
 
+        # (file_generator) Inject structured output instructions if file is requested
+        _file_intent = file_generator.detect_file_intent(user_message)
+        if _file_intent == "excel":
+            prompt += file_generator.get_excel_system_prompt(user_message)
+        elif _file_intent == "code":
+            prompt += file_generator.get_code_system_prompt(user_message)
+
         try:
             reply = await client.chat(message=prompt, model=model)
             
@@ -1904,6 +1912,56 @@ async def _send_ai_reply(
             )
         except BadRequest:
             await target.reply_text(extra)
+
+    # --- File generation: kirim file Excel / kode program jika diminta ---
+    try:
+        file_intent = file_generator.detect_file_intent(user_message)
+        if file_intent == "excel":
+            fname = file_generator.derive_filename(user_message, "excel")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            excel_buf = await file_generator.build_excel_from_ai(reply, filename=fname)
+            if excel_buf:
+                await target.reply_document(
+                    document=excel_buf,
+                    filename=f"{fname}.xlsx",
+                    caption=(
+                        f"📊 <b>File Excel siap!</b>\n"
+                        f"📄 <code>{fname}.xlsx</code>\n"
+                        "Silakan buka dan edit sesuai kebutuhan."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await target.reply_text(
+                    "⚠️ Tidak bisa membuat file Excel. Pastikan library <code>openpyxl</code> terinstall.",
+                    parse_mode=ParseMode.HTML,
+                )
+        elif file_intent == "code":
+            fname = file_generator.derive_filename(user_message, "code")
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+            code_result = await file_generator.build_code_file(reply, filename=fname)
+            if code_result:
+                code_buf, code_fname = code_result
+                await target.reply_document(
+                    document=code_buf,
+                    filename=code_fname,
+                    caption=(
+                        f"💾 <b>File kode siap!</b>\n"
+                        f"📄 <code>{code_fname}</code>\n"
+                        "Langsung bisa dijalankan. Cek README.md jika file ZIP."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await target.reply_text(
+                    "⚠️ AI tidak menghasilkan blok kode yang valid. "
+                    "Coba perjelas permintaanmu, misalnya: "
+                    "<i>'Buatkan program Python untuk ...'</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+    except Exception:
+        logger.exception("File generation failed — skipping file send")
+
 
     if follow_ups_enabled:
         asyncio.create_task(
